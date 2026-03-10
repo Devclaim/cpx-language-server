@@ -1,0 +1,558 @@
+{
+    "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+    "name": "CPX",
+    "scopeName": "source.cpx",
+    "fileTypes": ["cpx"],
+    "injections": {},
+    "patterns": [
+        {
+            "include": "#comments"
+        },
+        {
+            "include": "#import-statement"
+        },
+        {
+            "include": "#component-declaration"
+        },
+        {
+            "include": "#enum-declaration"
+        },
+        {
+            "include": "#render-block"
+        },
+        {
+            "include": "#property-declaration"
+        },
+        {
+            "include": "#keywords"
+        }
+    ],
+    "repository": {
+        "comments": {
+            "patterns": [
+                {
+                    "name": "comment.line.double-slash.cpx",
+                    "begin": "//",
+                    "end": "$"
+                },
+                {
+                    "name": "comment.block.cpx",
+                    "begin": "/\\*",
+                    "end": "\\*/"
+                }
+            ]
+        },
+        "component-declaration": {
+            "name": "meta.component.cpx",
+            "begin": "^(\\s*)(export)\\s+(component|struct)\\s+([A-Z][A-Za-z0-9_]*)\\s*(\\{)",
+            "beginCaptures": {
+                "2": {
+                    "name": "keyword.control.export.js"
+                },
+                "3": {
+                    "name": "storage.type.class.js"
+                },
+                "4": {
+                    "name": "entity.name.type.class.js"
+                },
+                "5": {
+                    "name": "punctuation.section.block.begin.cpx"
+                }
+            },
+            "end": "^(\\s*)(\\})\\s*$",
+            "endCaptures": {
+                "2": {
+                    "name": "punctuation.section.block.end.cpx"
+                }
+            },
+            "patterns": [
+                {
+                    "include": "#comments"
+                },
+                {
+                    "include": "#render-block"
+                },
+                {
+                    "include": "#property-declaration"
+                },
+                {
+                    "include": "#keywords"
+                }
+            ]
+        },
+        "enum-declaration": {
+            "name": "meta.enum.cpx",
+            "begin": "^(\\s*)(export)\\s+(enum)\\s+([A-Z][A-Za-z0-9_]*)\\s*(\\{)",
+            "beginCaptures": {
+                "2": {
+                    "name": "keyword.control.export.js"
+                },
+                "3": {
+                    "name": "storage.type.enum.js"
+                },
+                "4": {
+                    "name": "entity.name.type.class.js"
+                },
+                "5": {
+                    "name": "punctuation.section.block.begin.cpx"
+                }
+            },
+            "end": "^(\\s*)(\\})\\s*$",
+            "endCaptures": {
+                "2": {
+                    "name": "punctuation.section.block.end.cpx"
+                }
+            },
+            "patterns": [
+                {
+                    "include": "#comments"
+                },
+                {
+                    "name": "variable.other.enummember.js",
+                    "match": "\\b[A-Z][A-Z0-9_]*\\b(?=\\s*\\()"
+                },
+                {
+                    "name": "string.quoted.double.js",
+                    "begin": "\"",
+                    "end": "\"",
+                    "patterns": [
+                        {
+                            "name": "constant.character.escape.js",
+                            "match": "\\\\."
+                        }
+                    ]
+                },
+                {
+                    "include": "#expression"
+                },
+                {
+                    "include": "#keywords"
+                }
+            ]
+        },
+        "import-statement": {
+            "name": "meta.import.cpx",
+            "begin": "^(\\s*)(from)\\b",
+            "beginCaptures": {
+                "2": {
+                    "name": "keyword.control.import.js"
+                }
+            },
+            "end": "$",
+            "patterns": [
+                {
+                    "include": "#comments"
+                },
+                {
+                    "name": "string.quoted.double.js",
+                    "begin": "\"",
+                    "end": "\""
+                },
+                {
+                    "name": "keyword.control.import.js",
+                    "match": "\\b(import|from|as)\\b"
+                },
+                {
+                    "name": "variable.other.readwrite.js",
+                    "match": "\\b[a-z][A-Za-z0-9_]*\\b"
+                },
+                {
+                    "name": "entity.name.type.class.js",
+                    "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+                },
+                {
+                    "name": "punctuation.definition.bracket.curly.begin.js",
+                    "match": "\\{"
+                },
+                {
+                    "name": "punctuation.definition.bracket.curly.end.js",
+                    "match": "\\}"
+                },
+                {
+                    "name": "punctuation.separator.comma.js",
+                    "match": ","
+                }
+            ]
+        },
+        "cpx-attribute-value": {
+            "patterns": [
+                {
+                    "name": "string.quoted.double.html",
+                    "begin": "\"",
+                    "end": "\"",
+                    "patterns": [
+                        {
+                            "include": "#interpolation"
+                        }
+                    ]
+                },
+                {
+                    "name": "string.quoted.single.html",
+                    "begin": "'",
+                    "end": "'",
+                    "patterns": [
+                        {
+                            "include": "#interpolation"
+                        }
+                    ]
+                },
+                {
+                    "include": "#interpolation"
+                }
+            ]
+        },
+        "cpx-markup": {
+            "patterns": [
+                {
+                    "include": "#comments"
+                },
+                {
+                    "include": "#interpolation"
+                },
+                {
+                    "name": "meta.tag.block.any.html",
+                    "begin": "(</)([A-Z][A-Za-z0-9_]*)(?=\\s*>|/?>)",
+                    "beginCaptures": {
+                        "1": {
+                            "name": "punctuation.definition.tag.begin.html"
+                        },
+                        "2": {
+                            "name": "entity.name.type.class.js"
+                        }
+                    },
+                    "end": "(>)",
+                    "endCaptures": {
+                        "1": {
+                            "name": "punctuation.definition.tag.end.html"
+                        }
+                    }
+                },
+                {
+                    "name": "meta.tag.block.any.html",
+                    "begin": "(</)([a-z][A-Za-z0-9:-]*)(?=\\s*>|/?>)",
+                    "beginCaptures": {
+                        "1": {
+                            "name": "punctuation.definition.tag.begin.html"
+                        },
+                        "2": {
+                            "name": "entity.name.tag.html"
+                        }
+                    },
+                    "end": "(>)",
+                    "endCaptures": {
+                        "1": {
+                            "name": "punctuation.definition.tag.end.html"
+                        }
+                    }
+                },
+                {
+                    "name": "meta.tag.block.any.html",
+                    "begin": "(<)([A-Z][A-Za-z0-9_]*)(?=\\s|/?>)",
+                    "beginCaptures": {
+                        "1": {
+                            "name": "punctuation.definition.tag.begin.html"
+                        },
+                        "2": {
+                            "name": "entity.name.type.class.js"
+                        }
+                    },
+                    "end": "(/?>)",
+                    "endCaptures": {
+                        "1": {
+                            "name": "punctuation.definition.tag.end.html"
+                        }
+                    },
+                    "patterns": [
+                        {
+                            "name": "entity.other.attribute-name.html",
+                            "match": "\\b[a-zA-Z_:][-a-zA-Z0-9_:.]*\\b(?=\\s*=)"
+                        },
+                        {
+                            "name": "punctuation.separator.key-value.html",
+                            "match": "="
+                        },
+                        {
+                            "include": "#cpx-attribute-value"
+                        }
+                    ]
+                },
+                {
+                    "name": "meta.tag.block.any.html",
+                    "begin": "(<)([a-z][A-Za-z0-9:-]*)(?=\\s|/?>)",
+                    "beginCaptures": {
+                        "1": {
+                            "name": "punctuation.definition.tag.begin.html"
+                        },
+                        "2": {
+                            "name": "entity.name.tag.html"
+                        }
+                    },
+                    "end": "(/?>)",
+                    "endCaptures": {
+                        "1": {
+                            "name": "punctuation.definition.tag.end.html"
+                        }
+                    },
+                    "patterns": [
+                        {
+                            "name": "entity.other.attribute-name.html",
+                            "match": "\\b[a-zA-Z_:][-a-zA-Z0-9_:.]*\\b(?=\\s*=)"
+                        },
+                        {
+                            "name": "punctuation.separator.key-value.html",
+                            "match": "="
+                        },
+                        {
+                            "include": "#cpx-attribute-value"
+                        }
+                    ]
+                },
+                {
+                    "name": "text.html.basic",
+                    "match": "^[\\t ]*[A-Za-z][A-Za-z0-9' -]*(?:\\s+[A-Za-z0-9' -]+)+[\\t ]*$"
+                },
+                {
+                    "name": "text.html.basic",
+                    "match": "(?<=>)[^<{]+(?=<|\\{)"
+                }
+            ]
+        },
+        "interpolation": {
+            "name": "meta.interpolation.cpx",
+            "begin": "\\{",
+            "beginCaptures": {
+                "0": {
+                    "name": "punctuation.section.embedded.begin.cpx"
+                }
+            },
+            "end": "\\}",
+            "endCaptures": {
+                "0": {
+                    "name": "punctuation.section.embedded.end.cpx"
+                }
+            },
+            "patterns": [
+                {
+                    "include": "#comments"
+                },
+                {
+                    "include": "#cpx-markup"
+                },
+                {
+                    "include": "#expression"
+                }
+            ]
+        },
+        "expression": {
+            "patterns": [
+                {
+                    "include": "#comments"
+                },
+                {
+                    "include": "#interpolation"
+                },
+                {
+                    "name": "string.quoted.double.js",
+                    "begin": "\"",
+                    "end": "\"",
+                    "patterns": [
+                        {
+                            "name": "constant.character.escape.js",
+                            "match": "\\\\."
+                        }
+                    ]
+                },
+                {
+                    "name": "string.quoted.single.js",
+                    "begin": "'",
+                    "end": "'",
+                    "patterns": [
+                        {
+                            "name": "constant.character.escape.js",
+                            "match": "\\\\."
+                        }
+                    ]
+                },
+                {
+                    "name": "string.template.js",
+                    "begin": "`",
+                    "end": "`",
+                    "patterns": [
+                        {
+                            "include": "#interpolation"
+                        },
+                        {
+                            "name": "constant.character.escape.js",
+                            "match": "\\\\."
+                        }
+                    ]
+                },
+                {
+                    "name": "constant.numeric.js",
+                    "match": "\\b\\d+(?:\\.\\d+)?\\b"
+                },
+                {
+                    "name": "constant.language.boolean.js",
+                    "match": "\\b(true|false)\\b"
+                },
+                {
+                    "name": "constant.language.null.js",
+                    "match": "\\bnull\\b"
+                },
+                {
+                    "name": "keyword.control.cpx",
+                    "match": "\\bmatch\\b"
+                },
+                {
+                    "name": "keyword.operator.ternary.js",
+                    "match": "\\?|:"
+                },
+                {
+                    "name": "keyword.operator.arrow.cpx",
+                    "match": "->"
+                },
+                {
+                    "name": "keyword.operator.logical.js",
+                    "match": "&&|\\|\\||\\b(and|or)\\b"
+                },
+                {
+                    "name": "keyword.operator.type.cpx",
+                    "match": "\\|"
+                },
+                {
+                    "name": "keyword.operator.comparison.js",
+                    "match": "===|!==|==|!=|>=|<=|>|<"
+                },
+                {
+                    "name": "keyword.operator.assignment.js",
+                    "match": "="
+                },
+                {
+                    "name": "keyword.operator.accessor.js",
+                    "match": "\\."
+                },
+                {
+                    "name": "keyword.operator.arithmetic.js",
+                    "match": "\\+|-|\\*|/|%"
+                },
+                {
+                    "name": "punctuation.separator.comma.js",
+                    "match": ","
+                },
+                {
+                    "name": "punctuation.terminator.statement.js",
+                    "match": ";"
+                },
+                {
+                    "name": "punctuation.definition.array.begin.js",
+                    "match": "\\["
+                },
+                {
+                    "name": "punctuation.definition.array.end.js",
+                    "match": "\\]"
+                },
+                {
+                    "name": "punctuation.definition.group.begin.js",
+                    "match": "\\("
+                },
+                {
+                    "name": "punctuation.definition.group.end.js",
+                    "match": "\\)"
+                },
+                {
+                    "name": "punctuation.definition.block.begin.js",
+                    "match": "\\{"
+                },
+                {
+                    "name": "punctuation.definition.block.end.js",
+                    "match": "\\}"
+                },
+                {
+                    "name": "entity.name.type.class.js",
+                    "match": "\\??(?:boolean|string|number|slot)\\b"
+                },
+                {
+                    "name": "variable.other.enummember.js",
+                    "match": "\\b[A-Z][A-Z0-9_]*\\b"
+                },
+                {
+                    "name": "entity.name.type.class.js",
+                    "match": "\\??[A-Z][A-Za-z0-9_]*\\b"
+                },
+                {
+                    "name": "variable.other.property.js",
+                    "match": "\\b[a-z][A-Za-z0-9_]*\\b"
+                }
+            ]
+        },
+        "keywords": {
+            "patterns": [
+                {
+                    "name": "keyword.control.import.js",
+                    "match": "\\b(import|from|as)\\b"
+                },
+                {
+                    "name": "keyword.control.export.js",
+                    "match": "\\bexport\\b"
+                },
+                {
+                    "name": "storage.type.class.js",
+                    "match": "\\b(component|struct)\\b"
+                },
+                {
+                    "name": "storage.type.enum.js",
+                    "match": "\\benum\\b"
+                },
+                {
+                    "name": "keyword.control.cpx",
+                    "match": "\\brender\\b"
+                }
+            ]
+        },
+        "property-declaration": {
+            "name": "meta.property.cpx",
+            "begin": "^(\\s*)([a-z][A-Za-z0-9_]*)(\\s*:\\s*)",
+            "beginCaptures": {
+                "2": {
+                    "name": "variable.other.property.js"
+                },
+                "3": {
+                    "name": "punctuation.separator.key-value.cpx"
+                }
+            },
+            "end": "$",
+            "patterns": [
+                {
+                    "name": "entity.name.type.class.js",
+                    "match": "\\??(?:slot|boolean|string|number|[A-Z][A-Za-z0-9_]*)"
+                },
+                {
+                    "name": "keyword.operator.type.cpx",
+                    "match": "\\|"
+                }
+            ]
+        },
+        "render-block": {
+            "name": "meta.render.cpx",
+            "begin": "^(\\s*)(render)\\b",
+            "beginCaptures": {
+                "2": {
+                    "name": "keyword.control.cpx"
+                }
+            },
+            "end": "(?=^(\\s*)\\})",
+            "contentName": "meta.markup.cpx",
+            "patterns": [
+                {
+                    "include": "#comments"
+                },
+                {
+                    "include": "#interpolation"
+                },
+                {
+                    "include": "#cpx-markup"
+                }
+            ]
+        }
+    }
+}
