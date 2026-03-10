@@ -2,6 +2,8 @@
 
 VS Code support for `.cpx` files.
 
+Related project: [Component Engine](https://codeberg.org/PackageFactory/component-engine)
+
 ## Status
 
 This extension is placeholder work. It is heavily vibe-coded and not representative of the real CPX grammar. The current implementation is only a rough editor aid for experimentation.

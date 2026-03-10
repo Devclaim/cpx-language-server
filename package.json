@@ -1,7 +1,7 @@
 {
-    "name": "cpx-language",
-    "displayName": "CPX Language",
-    "description": "Language Server and TextGrammar for CPX components",
+    "name": "component-engine-language-support",
+    "displayName": "Component Engine (CPX) Language Support",
+    "description": "Placeholder language support for Component Engine (CPX)",
     "version": "0.0.1",
     "publisher": "Devclaim",
     "license": "MIT",
