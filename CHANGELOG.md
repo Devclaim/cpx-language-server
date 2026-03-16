@@ -2,6 +2,11 @@
 
 All notable changes to the "cpx" extension will be documented in this file.
 
+## [0.0.2]
+
+- Added hover support for CPX components, structs, and enums
+- Added prop hovers in component tags, including inline struct and enum details
+
 ## [0.0.1]
 
 - Initial placeholder release

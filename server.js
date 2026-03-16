@@ -11,6 +11,7 @@ const {
     CompletionItemKind,
     InsertTextFormat,
     InsertTextMode,
+    MarkupKind,
     Location,
     Position,
     Range
@@ -123,13 +124,31 @@ function parseExports(text) {
             name,
             range: makeRange(text, nameOffset, nameOffset + name.length),
             bodyRange: makeRange(text, blockStart, blockEnd + 1),
+            members: kind === "enum"
+                ? parseEnumMembers(text.slice(blockStart + 1, blockEnd))
+                : [],
             props: kind === "component" || kind === "struct"
-                ? parsePropertyDeclarations(text.slice(blockStart + 1, blockEnd))
+                ? parsePropertyDeclarations(text.slice(blockStart + 1, blockEnd), blockStart + 1, text)
                 : []
         });
     }
 
     return exports;
+}
+
+function parseEnumMembers(blockText) {
+    const members = [];
+    const memberRegex = /^\s*([A-Z][A-Z0-9_]*)(?:\(([^)]*)\))?\s*$/gm;
+    let match;
+
+    while ((match = memberRegex.exec(blockText))) {
+        members.push({
+            name: match[1],
+            value: match[2] ? match[2].trim() : ""
+        });
+    }
+
+    return members;
 }
 
 function findBlockEnd(text, blockStart) {
@@ -149,15 +168,23 @@ function findBlockEnd(text, blockStart) {
     return text.length;
 }
 
-function parsePropertyDeclarations(blockText) {
+function parsePropertyDeclarations(blockText, baseOffset = 0, fullText = blockText) {
     const props = [];
     const propertyRegex = /^\s*([a-z][A-Za-z0-9_]*)\s*:\s*(\??(?:slot|boolean|string|number|[A-Z][A-Za-z0-9_]*)(?:\s*\|\s*\??(?:slot|boolean|string|number|[A-Z][A-Za-z0-9_]*))*)\s*$/gm;
     let match;
 
     while ((match = propertyRegex.exec(blockText))) {
+        const fullMatch = match[0];
+        const name = match[1];
+        const type = match[2];
+        const matchStart = baseOffset + match.index;
+        const nameStart = matchStart + fullMatch.indexOf(name);
+        const typeStart = matchStart + fullMatch.lastIndexOf(type);
         props.push({
-            name: match[1],
-            type: match[2]
+            name,
+            type,
+            range: makeRange(fullText, nameStart, nameStart + name.length),
+            typeRange: makeRange(fullText, typeStart, typeStart + type.length)
         });
     }
 
@@ -205,6 +232,25 @@ function parseTypeUsages(text) {
     return usages;
 }
 
+function parseEnumMemberUsages(text) {
+    const usages = [];
+    const enumRegex = /\b([A-Z][A-Za-z0-9_]*)\.([A-Z][A-Z0-9_]*)\b/g;
+    let match;
+
+    while ((match = enumRegex.exec(text))) {
+        const owner = match[1];
+        const member = match[2];
+        const memberStart = match.index + match[0].lastIndexOf(member);
+        usages.push({
+            owner,
+            member,
+            range: makeRange(text, memberStart, memberStart + member.length)
+        });
+    }
+
+    return usages;
+}
+
 function indexDocument(fsPath, text) {
     const normalized = normalizePath(fsPath);
     const parsed = {
@@ -213,6 +259,7 @@ function indexDocument(fsPath, text) {
         exports: parseExports(text),
         usages: parseComponentUsages(text),
         typeUsages: parseTypeUsages(text),
+        enumMemberUsages: parseEnumMemberUsages(text),
         text
     };
 
@@ -238,6 +285,37 @@ function indexDocument(fsPath, text) {
         });
         exportIndex.set(exported.name, entries);
     }
+}
+
+function refreshDocumentFromDisk(fsPath) {
+    try {
+        const text = fs.readFileSync(fsPath, "utf8");
+        indexDocument(fsPath, text);
+        return documentIndex.get(normalizePath(fsPath)) || null;
+    } catch {
+        return null;
+    }
+}
+
+function ensureCompleteExport(exported, ownerPath) {
+    if (!exported || !ownerPath) {
+        return exported;
+    }
+
+    const needsRefresh =
+        (exported.kind === "enum" && (!exported.members || exported.members.length === 0)) ||
+        ((exported.kind === "component" || exported.kind === "struct") && (!exported.props || exported.props.length === 0));
+
+    if (!needsRefresh) {
+        return exported;
+    }
+
+    const refreshed = refreshDocumentFromDisk(ownerPath);
+    if (!refreshed) {
+        return exported;
+    }
+
+    return refreshed.exports.find((entry) => entry.name === exported.name) || exported;
 }
 
 function resolveImportPath(fromFile, importPath) {
@@ -316,6 +394,31 @@ function isClosingTagContext(text, position) {
     const lineStart = text.lastIndexOf("\n", offset - 1) + 1;
     const prefix = text.slice(lineStart, offset);
     return /<\/[A-Z][A-Za-z0-9_]*$/.test(prefix) || /<\/$/.test(prefix);
+}
+
+function getOpenTagContext(text, position) {
+    const offset = offsetAt(text, position);
+    const left = text.slice(0, offset);
+    const tagStart = left.lastIndexOf("<");
+    if (tagStart === -1) {
+        return null;
+    }
+
+    const tail = left.slice(tagStart);
+    if (tail.startsWith("</") || tail.includes(">")) {
+        return null;
+    }
+
+    const match = tail.match(/^<([A-Z][A-Za-z0-9_]*)(?:\s+[^<>]*)?$/);
+    if (!match) {
+        return null;
+    }
+
+    const attrMatch = tail.match(/\s+([a-zA-Z_:][-a-zA-Z0-9_:.]*)?$/);
+    return {
+        tagName: match[1],
+        partialAttribute: attrMatch && attrMatch[1] ? attrMatch[1] : ""
+    };
 }
 
 function buildComponentSnippet(candidate, closingTagContext) {
@@ -452,6 +555,135 @@ function resolveStructForProperty(parsed, position, propertyName) {
         if (resolved && resolved.kind === "struct") {
             return resolved;
         }
+    }
+
+    return null;
+}
+
+function resolvePropertyAtPosition(parsed, position, word) {
+    const owner = getExportAtPosition(parsed, position);
+    if (!owner || !owner.props) {
+        return null;
+    }
+
+    for (const prop of owner.props) {
+        if (prop.range && isInsideRange(position, prop.range)) {
+            return prop;
+        }
+        if (prop.typeRange && isInsideRange(position, prop.typeRange)) {
+            return prop;
+        }
+    }
+
+    if (!word || !/^[a-z][A-Za-z0-9_]*$/.test(word)) {
+        return null;
+    }
+
+    return owner.props.find((prop) => prop.name === word) || null;
+}
+
+function resolveComponentPropAtPosition(parsed, position, word) {
+    const openTagContext = getOpenTagContext(parsed.text, position);
+    if (!openTagContext || !word || !/^[a-z][A-Za-z0-9_]*$/.test(word)) {
+        return null;
+    }
+
+    const resolved = resolveImportedSymbol(parsed, openTagContext.tagName);
+    if (!resolved || !resolved.props) {
+        return null;
+    }
+
+    const prop = resolved.props.find((entry) => entry.name === word);
+    if (!prop) {
+        return null;
+    }
+
+    const imported = parsed.imports.find((entry) => entry.names.some((item) => item.name === openTagContext.tagName));
+    if (imported) {
+        const resolvedPath = resolveImportPath(parsed.path, imported.source);
+        const ownerParsed = resolvedPath
+            ? (refreshDocumentFromDisk(resolvedPath) || documentIndex.get(resolvedPath))
+            : null;
+        return {
+            prop,
+            ownerParsed: ownerParsed || parsed
+        };
+    }
+
+    return {
+        prop,
+        ownerParsed: parsed
+    };
+}
+
+function buildHoverCodeLines(exported) {
+    const lines = [`export ${exported.kind} ${exported.name} {`];
+
+    if (exported.kind === "enum") {
+        for (const member of exported.members || []) {
+            lines.push(member.value ? `    ${member.name}(${member.value})` : `    ${member.name}`);
+        }
+    } else {
+        for (const prop of exported.props || []) {
+            lines.push(`    ${prop.name}: ${prop.type}`);
+        }
+    }
+
+    lines.push("}");
+
+    return lines;
+}
+
+function buildHoverForExport(exported) {
+    return {
+        contents: {
+            kind: MarkupKind.Markdown,
+            value: ["```cpx", ...buildHoverCodeLines(exported), "```"].join("\n")
+        }
+    };
+}
+
+function buildHoverForProperty(prop, parsed) {
+    const blocks = [
+        ["```cpx", `${prop.name}: ${prop.type}`, "```"].join("\n")
+    ];
+
+    for (const typeName of extractNamedTypes(prop.type)) {
+        const exported = resolveSymbolExport(parsed, typeName);
+        if (exported) {
+            blocks.push(["```cpx", buildHoverCodeLines(exported).join("\n"), "```"].join("\n"));
+        }
+    }
+
+    return {
+        contents: {
+            kind: MarkupKind.Markdown,
+            value: blocks.join("\n\n")
+        }
+    };
+}
+
+function resolveSymbolExport(parsed, symbolName) {
+    const imported = parsed.imports.find((entry) => entry.names.some((item) => item.name === symbolName));
+    if (imported) {
+        const resolved = resolveImportPath(parsed.path, imported.source);
+        const target = resolved ? documentIndex.get(resolved) : null;
+        const exported = target && target.exports.find((entry) => entry.name === symbolName);
+        if (exported) {
+            return ensureCompleteExport(exported, resolved);
+        }
+    }
+
+    const localExport = parsed.exports.find((entry) => entry.name === symbolName);
+    if (localExport) {
+        return ensureCompleteExport(localExport, parsed.path);
+    }
+
+    const candidates = exportIndex.get(symbolName);
+    if (candidates && candidates.length > 0) {
+        const target = documentIndex.get(candidates[0].path);
+        const exported = target && target.exports.find((entry) => entry.name === symbolName);
+        return ensureCompleteExport(exported, candidates[0].path);
     }
 
     return null;
@@ -606,6 +838,7 @@ connection.onInitialize(async (params) => {
         capabilities: {
             textDocumentSync: TextDocumentSyncKind.Incremental,
             definitionProvider: true,
+            hoverProvider: true,
             semanticTokensProvider: {
                 legend: semanticTokenLegend,
                 full: true
@@ -755,14 +988,34 @@ connection.onCompletion((params) => {
     const word = currentWord(text, params.position);
     const tagContext = isTagContext(text, params.position);
     const closingTagContext = isClosingTagContext(text, params.position);
+    const openTagContext = getOpenTagContext(text, params.position);
     const typeContext = isTypeContext(text, params.position);
     const expressionContext = isExpressionContext(text, params.position);
 
     if (!tagContext && !typeContext && !expressionContext) {
-        return [];
+        if (!openTagContext) {
+            return [];
+        }
     }
 
     const items = [];
+
+    if (openTagContext && !tagContext && !closingTagContext) {
+        const resolved = resolveImportedSymbol(parsed, openTagContext.tagName);
+        if (!resolved || !resolved.props) {
+            return [];
+        }
+
+        return resolved.props
+            .filter((prop) => !openTagContext.partialAttribute || prop.name.toLowerCase().startsWith(openTagContext.partialAttribute.toLowerCase()))
+            .map((prop) => ({
+                label: prop.name,
+                kind: CompletionItemKind.Property,
+                detail: prop.type,
+                insertText: `${prop.name}=`,
+                insertTextFormat: InsertTextFormat.PlainText
+            }));
+    }
 
     if (expressionContext) {
         const owner = getExportAtPosition(parsed, params.position);
@@ -827,6 +1080,86 @@ connection.onCompletion((params) => {
     }
 
     return items;
+});
+
+connection.onHover((params) => {
+    const parsed = getDocumentData(params.textDocument.uri);
+    if (!parsed) {
+        return null;
+    }
+
+    const word = currentWord(parsed.text, params.position);
+    const componentProp = resolveComponentPropAtPosition(parsed, params.position, word);
+    if (componentProp) {
+        return buildHoverForProperty(componentProp.prop, componentProp.ownerParsed);
+    }
+
+    const localProp = resolvePropertyAtPosition(parsed, params.position, word);
+    if (localProp) {
+        return buildHoverForProperty(localProp, parsed);
+    }
+
+    for (const usage of parsed.usages) {
+        if (!isInsideRange(params.position, usage.range)) {
+            continue;
+        }
+
+        const imported = parsed.imports.find((entry) => entry.names.some((item) => item.name === usage.name));
+        if (imported) {
+            const exported = resolveSymbolExport(parsed, usage.name);
+            if (exported) {
+                return buildHoverForExport(exported);
+            }
+        }
+        const exported = resolveSymbolExport(parsed, usage.name);
+        if (exported) {
+            return buildHoverForExport(exported);
+        }
+    }
+
+    for (const usage of parsed.typeUsages) {
+        if (!isInsideRange(params.position, usage.range)) {
+            continue;
+        }
+
+        const exported = resolveSymbolExport(parsed, usage.name);
+        if (exported) {
+            return buildHoverForExport(exported);
+        }
+    }
+
+    for (const usage of parsed.enumMemberUsages || []) {
+        if (!isInsideRange(params.position, usage.range)) {
+            continue;
+        }
+
+        const exported = resolveSymbolExport(parsed, usage.owner);
+        if (exported) {
+            return buildHoverForExport(exported);
+        }
+    }
+
+    for (const importEntry of parsed.imports) {
+        for (const importedName of importEntry.names) {
+            if (!isInsideRange(params.position, importedName.range)) {
+                continue;
+            }
+
+            const exported = resolveSymbolExport(parsed, importedName.name);
+            if (exported) {
+                return buildHoverForExport(exported);
+            }
+        }
+    }
+
+    if (word && /^[A-Z][A-Za-z0-9_]*$/.test(word)) {
+        const exported = resolveSymbolExport(parsed, word);
+        if (exported) {
+            return buildHoverForExport(exported);
+        }
+    }
+
+    return null;
 });
 
 connection.languages.semanticTokens.on((params) => {
