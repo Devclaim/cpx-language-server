@@ -240,7 +240,7 @@ ok('struct – all type variants', `export struct S {
   c: integer
   d: boolean
   e: MyType
-  f: string[]
+  f: Button[]
   g: Red | Green | Blue
 }`);
 
@@ -504,6 +504,26 @@ fail('missing arrow in match arm', `export component X {
 }`, null);
 fail('empty enum body', `export enum E {}`, null);
 fail('missing closing brace in component', `export component X { render <div/>`, '"}"');
+fail('boolean[] is not allowed', `export component X {
+  items: boolean[]
+  render <div />
+}`, 'cannot be used as a collection type');
+fail('string[] is not allowed', `export component X {
+  items: string[]
+  render <div />
+}`, 'cannot be used as a collection type');
+fail('number[] is not allowed', `export component X {
+  items: number[]
+  render <div />
+}`, 'cannot be used as a collection type');
+fail('slot[] is not allowed', `export component X {
+  items: slot[]
+  render <div />
+}`, 'cannot be used as a collection type');
+ok('component[] is allowed', `export component X {
+  items: Button[]
+  render <div />
+}`);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SUMMARY

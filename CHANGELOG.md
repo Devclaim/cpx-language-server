@@ -2,6 +2,56 @@
 
 All notable changes to the "cpx" extension will be documented in this file.
 
+## [0.2.0] - 2026-06-01
+
+### Error Checking
+
+- **Undeclared prop reference** — identifiers used in render expressions (`match (x)`, `{x}`, access chains `x.field`) that are not declared as props on the enclosing component are now flagged as errors
+- **Primitive collection types** — `boolean[]`, `string[]`, `number[]`, and `slot[]` are now flagged at both the parser level and the semantic level (only component/struct types support `[]`)
+
+### Unused Import Warnings
+
+- Imports not referenced anywhere in the file are shown with reduced opacity and a yellow warning squiggle (`DiagnosticTag.Unnecessary`)
+- Partial unused imports — where only some names in a multi-name import are unused — highlight the specific unused name rather than the whole import line
+- Fixed a false positive where a component name appearing inside a file path string (e.g. `"../Accordion/Accordion.cpx"`) was incorrectly counted as a usage, suppressing the warning
+
+## [0.1.5] - 2026-06-01
+
+### Language Server
+
+- Primitive types (`string`, `number`, `boolean`, `slot`) are now offered as completions when declaring a prop type, alongside enums and components
+
+## [0.1.4] - 2026-06-01
+
+### Bug Fixes
+
+- Fixed completions (component suggestions, prop hints, auto-imports) becoming stale after typing — indexing now runs immediately on every change; only diagnostic squiggles are debounced
+
+## [0.1.3] - 2026-06-01
+
+### Syntax Highlighting
+
+- `EnumName.MEMBER` access expressions now correctly color the member as `variable.other.enummember.js` (blue) instead of the class/type color (teal)
+
+### Language Server
+
+- Match completions now appear while typing `mat`/`matc`/`match` — no longer requires a trailing space to trigger
+- Fixed match snippet eating the `match` keyword on insertion — completion now uses an explicit text edit range covering from `match` to the cursor
+- Fixed spurious error squiggle appearing immediately after inserting a match snippet — validation is debounced (300 ms) so rapid edits don't fire on a transient document state
+- Fixed component suggestions and other completions being blocked when match context was detected but no enum props were found
+
+## [0.1.2] - 2026-06-01
+
+### Bug Fixes
+
+- Fixed language server not starting after VSIX install — dependencies are now bundled correctly
+
+## [0.1.1] - 2026-06-01
+
+### Language Server
+
+- Match arm snippets now use the file's actual indentation (tabs or spaces) instead of hardcoded two-space indent
+
 ## [0.1.0] - 2026-06-01
 
 ### Syntax Highlighting

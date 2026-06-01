@@ -516,12 +516,21 @@ class CPXParser {
     // ── Type Reference ────────────────────────────────────────────────────────
 
     parseTypeReference() {
+        const PRIMITIVES = new Set(['boolean', 'string', 'number', 'slot']);
         if (this.tryLiteral('?')) {
             this.requireIdentifier();
             return;
         }
-        this.requireIdentifier();
-        if (this.tryLiteral('[]')) return; // array type  e.g. string[]
+        const typeName = this.requireIdentifier();
+        if (this.tryLiteral('[]')) {
+            if (PRIMITIVES.has(typeName)) {
+                throw new ParseError(
+                    `"${typeName}" cannot be used as a collection type — only components support []`,
+                    this.line, this.col - 2, this.line, this.col
+                );
+            }
+            return;
+        }
         // Union type: Identifier (| Identifier)*  – spaces around | are tolerated
         while (true) {
             const s = this.save();

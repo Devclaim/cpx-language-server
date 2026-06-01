@@ -2,7 +2,7 @@
     "name": "component-engine-language-support",
     "displayName": "Component Engine (CPX) Language Support",
     "description": "Placeholder language support for Component Engine (CPX)",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "publisher": "Devclaim",
     "license": "MIT",
     "repository": {
@@ -21,7 +21,7 @@
     ],
     "categories": ["Programming Languages"],
     "scripts": {
-        "check": "node --check extension.js && node --check server.js"
+        "check": "node --check extension.js && node --check server.js && node cpxParser.test.js && node server.test.js"
     },
     "dependencies": {
         "vscode-languageclient": "^9.0.1",

@@ -17,7 +17,8 @@ const {
     Position,
     Range,
     Diagnostic,
-    DiagnosticSeverity
+    DiagnosticSeverity,
+    DiagnosticTag
 } = require("vscode-languageserver/node");
 const { TextDocument } = require("vscode-languageserver-textdocument");
 
@@ -93,6 +94,7 @@ function parseImports(text) {
 
         imports.push({
             source,
+            range: makeRange(text, match.index, match.index + match[0].length),
             sourceRange: makeRange(
                 text,
                 match.index + match[0].indexOf(`"${source}"`) + 1,
@@ -194,6 +196,57 @@ function parsePropertyDeclarations(blockText, baseOffset = 0, fullText = blockTe
     return props;
 }
 
+/**
+ * Scans the render body of a component for bare lowercase identifiers used in
+ * expression positions: match subjects, brace expressions, and access chains.
+ * Returns [{name, range}] — each entry is one occurrence.
+ */
+function parseIdentifierUsagesInRender(text, component) {
+    const bodyStart = offsetAt(text, component.bodyRange.start);
+    const bodyEnd = offsetAt(text, component.bodyRange.end);
+    const bodyText = text.slice(bodyStart, bodyEnd);
+
+    const renderMatch = /\brender\b/.exec(bodyText);
+    if (!renderMatch) return [];
+
+    const renderOffset = bodyStart + renderMatch.index + renderMatch[0].length;
+    const renderText = bodyText.slice(renderMatch.index + renderMatch[0].length);
+
+    // Strip string literals to avoid false matches inside "path/To/File.cpx"
+    const stripped = renderText.replace(/"[^"]*"/g, (m) => ' '.repeat(m.length));
+
+    const KEYWORDS = new Set(['null', 'true', 'false', 'match', 'default', 'render', 'slot']);
+    const usages = [];
+
+    function addUsage(name, matchIndex, nameIndexInMatch) {
+        if (KEYWORDS.has(name)) return;
+        const nameOffset = renderOffset + matchIndex + nameIndexInMatch;
+        usages.push({ name, range: makeRange(text, nameOffset, nameOffset + name.length) });
+    }
+
+    // Pattern 1: match (identifier) — match subject
+    const matchSubjectRe = /\bmatch\s*\(\s*([a-z][A-Za-z0-9_]*)\s*\)/g;
+    let m;
+    while ((m = matchSubjectRe.exec(stripped))) {
+        addUsage(m[1], m.index, m[0].indexOf(m[1]));
+    }
+
+    // Pattern 2: {identifier} — bare identifier expression (e.g. {button}, content={headline})
+    const braceExprRe = /\{\s*([a-z][A-Za-z0-9_]*)\s*\}/g;
+    while ((m = braceExprRe.exec(stripped))) {
+        addUsage(m[1], m.index, m[0].indexOf(m[1]));
+    }
+
+    // Pattern 3: identifier. — prop used as access chain root (e.g. prop.field?.nested)
+    // Must not be preceded by . (avoid matching inside PascalCase.member)
+    const accessChainRe = /(?<![.A-Za-z0-9_])([a-z][A-Za-z0-9_]*)\./g;
+    while ((m = accessChainRe.exec(stripped))) {
+        addUsage(m[1], m.index, m[0].indexOf(m[1]));
+    }
+
+    return usages;
+}
+
 function parseComponentUsages(text) {
     const usages = [];
     const tagRegex = /<([A-Z][A-Za-z0-9_]*)\b/g;
@@ -219,14 +272,16 @@ function parseTypeUsages(text) {
     while ((match = propertyRegex.exec(text))) {
         const typesText = match[1];
         const baseOffset = match.index + match[0].lastIndexOf(typesText);
-        const typeRegex = /\??([A-Z][A-Za-z0-9_]*)/g;
+        const typeRegex = /\??([A-Z][A-Za-z0-9_]*)(\[\])?/g;
         let typeMatch;
 
         while ((typeMatch = typeRegex.exec(typesText))) {
             const name = typeMatch[1];
+            const isCollection = typeMatch[2] === "[]";
             const startOffset = baseOffset + typeMatch.index + typeMatch[0].lastIndexOf(name);
             usages.push({
                 name,
+                isCollection,
                 range: makeRange(text, startOffset, startOffset + name.length)
             });
         }
@@ -236,11 +291,14 @@ function parseTypeUsages(text) {
 }
 
 function parseEnumMemberUsages(text) {
+    // Strip string literal contents so file paths like "Accordion.cpx"
+    // don't get matched as enum member accesses
+    const stripped = text.replace(/"[^"]*"/g, (m) => '"' + ' '.repeat(m.length - 2) + '"');
     const usages = [];
     const enumRegex = /\b([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
     let match;
 
-    while ((match = enumRegex.exec(text))) {
+    while ((match = enumRegex.exec(stripped))) {
         const owner = match[1];
         const member = match[2];
         const memberStart = match.index + match[0].lastIndexOf(member);
@@ -511,6 +569,22 @@ function getMemberAccessContext(text, position) {
 }
 
 /**
+ * Detect if the cursor is right after the `match` keyword, before any `{`.
+ * Returns { partial: string } where partial is whatever the user has typed
+ * so far as the subject (may be empty), or null if not in this position.
+ */
+function getMatchSubjectContext(text, position) {
+    const offset = offsetAt(text, position);
+    const left = text.slice(0, offset);
+    // `match` followed by optional whitespace + optional partial word, but no `{` yet.
+    // Space is not a trigger character so we also match right after the `match`
+    // keyword itself (zero spaces) so completions fire as the user finishes typing.
+    const m = left.match(/\bmatch(\s+([\w.]*))?$/);
+    if (!m) return null;
+    return { partial: m[2] || "", matchStart: offset - m[0].length };
+}
+
+/**
  * Detect if the cursor is at the opening of a match body and return the
  * subject identifier so we can offer enum-aware arm completion.
  *
@@ -537,11 +611,21 @@ function getMatchBodyContext(text, position) {
  *   Status.INACTIVE -> $2,
  *   default -> $0
  */
-function buildMatchArmsSnippet(enumExport) {
+function detectIndent(text) {
+    for (const line of text.split(/\r?\n/)) {
+        if (/^\t/.test(line)) return '\t';
+        const m = line.match(/^( {2,})/);
+        if (m) return m[1].length % 4 === 0 ? '    ' : '  ';
+    }
+    return '    ';
+}
+
+function buildMatchArmsSnippet(enumExport, indent) {
+    const ind = indent || '    ';
     const name = enumExport.name;
     const members = enumExport.members || [];
-    const lines = members.map((m, i) => `  ${name}.${m.name} -> $${i + 1}`);
-    lines.push("  default -> $0");
+    const lines = members.map((m, i) => `${ind}${name}.${m.name} -> "$${i + 1}"`);
+    lines.push(`${ind}default -> "$0"`);
     return lines.join(",\n") + "\n";
 }
 
@@ -921,6 +1005,36 @@ function runCpxCheck(text) {
 
 const PRIMITIVE_TYPES = new Set(["boolean", "string", "number", "slot"]);
 
+function unusedImportDiagnostics(parsed) {
+    const usedNames = new Set([
+        ...parsed.usages.map((u) => u.name),
+        ...parsed.typeUsages.map((u) => u.name),
+        ...parsed.enumMemberUsages.map((u) => u.owner)
+    ]);
+    const diagnostics = [];
+    for (const importEntry of parsed.imports) {
+        const unusedNames = importEntry.names.filter((n) => !usedNames.has(n.name));
+        if (unusedNames.length === 0) continue;
+
+        const allUnused = unusedNames.length === importEntry.names.length;
+        for (const name of unusedNames) {
+            // If the whole import line is unused, fade the entire line.
+            // If only some names are unused, fade just the name token.
+            const range = allUnused ? importEntry.range : name.range;
+            const diag = Diagnostic.create(
+                range,
+                `"${name.name}" is imported but never used`,
+                DiagnosticSeverity.Warning,
+                "unused-import",
+                "cpx"
+            );
+            diag.tags = [DiagnosticTag.Unnecessary];
+            diagnostics.push(diag);
+        }
+    }
+    return diagnostics;
+}
+
 function validateDocument(parsed) {
     const diagnostics = [];
 
@@ -991,7 +1105,25 @@ function validateDocument(parsed) {
         }
     }
 
-    // 4. Components must have a render block
+    // 4. Collection types must be components
+    for (const usage of parsed.typeUsages) {
+        if (!usage.isCollection) continue;
+        const resolved = resolveImportedSymbol(parsed, usage.name);
+        if (resolved && resolved.kind !== "component") {
+            diagnostics.push(Diagnostic.create(
+                usage.range,
+                `"${usage.name}" cannot be used as a collection type — only components support []`,
+                DiagnosticSeverity.Error,
+                undefined,
+                "cpx"
+            ));
+        }
+    }
+
+    // 5. Unused imports
+    diagnostics.push(...unusedImportDiagnostics(parsed));
+
+    // 6. Components must have a render block
     for (const exported of parsed.exports) {
         if (exported.kind !== "component") {
             continue;
@@ -1010,6 +1142,28 @@ function validateDocument(parsed) {
         }
     }
 
+    // 7. Prop identifier usages in render body must reference a declared prop
+    for (const exported of parsed.exports) {
+        if (exported.kind !== "component") continue;
+        const declaredProps = new Set((exported.props || []).map(p => p.name));
+        const identUsages = parseIdentifierUsagesInRender(parsed.text, exported);
+        const seen = new Set(); // deduplicate same name+position isn't needed, but avoid same name from multiple patterns
+        for (const usage of identUsages) {
+            const key = `${usage.name}:${usage.range.start.line}:${usage.range.start.character}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            if (!declaredProps.has(usage.name)) {
+                diagnostics.push(Diagnostic.create(
+                    usage.range,
+                    `"${usage.name}" is not a declared prop of "${exported.name}"`,
+                    DiagnosticSeverity.Error,
+                    undefined,
+                    "cpx"
+                ));
+            }
+        }
+    }
+
     return diagnostics;
 }
 
@@ -1020,9 +1174,11 @@ function validateAndPublish(uri, parsed) {
     }
 
     const parserDiagnostics = runCpxCheck(parsed.text);
+    // Semantic checks only run on a syntax-clean file, but unused-import
+    // warnings are independent of syntax and always run.
     const semanticDiagnostics = parserDiagnostics.length === 0
-        ? validateDocument(parsed)   // only run semantic checks when syntax is clean
-        : [];
+        ? validateDocument(parsed)
+        : unusedImportDiagnostics(parsed);
 
     connection.sendDiagnostics({
         uri,
@@ -1050,7 +1206,7 @@ connection.onInitialize(async (params) => {
                 full: true
             },
             completionProvider: {
-                triggerCharacters: ["<", "{", "\"", "/", "."]
+                triggerCharacters: ["<", "{", "\"", "/", ".", " "]
             }
         }
     };
@@ -1064,12 +1220,19 @@ documents.onDidOpen((event) => {
     }
 });
 
+const validateTimers = new Map();
 documents.onDidChangeContent((event) => {
-    const fsPath = toFsPath(event.document.uri);
-    if (fsPath) {
-        indexDocument(fsPath, event.document.getText());
-        validateAndPublish(event.document.uri, getDocumentData(event.document.uri));
-    }
+    const uri = event.document.uri;
+    const fsPath = toFsPath(uri);
+    if (!fsPath) return;
+    // Index immediately so completions, hover, and definitions stay current.
+    indexDocument(fsPath, event.document.getText());
+    // Debounce only diagnostics to avoid spurious errors on transient states.
+    if (validateTimers.has(uri)) clearTimeout(validateTimers.get(uri));
+    validateTimers.set(uri, setTimeout(() => {
+        validateTimers.delete(uri);
+        validateAndPublish(uri, getDocumentData(uri));
+    }, 300));
 });
 
 documents.onDidSave((event) => {
@@ -1181,6 +1344,51 @@ connection.onCompletion((params) => {
         return [];
     }
 
+    // ── Match subject completions ──────────────────────────────────────────
+    // Triggered right after the `match` keyword, before the opening `{`.
+    // Offers every enum-typed prop as a full match-block snippet.
+    const triggerChar = params.context && params.context.triggerCharacter;
+    const matchSubject = getMatchSubjectContext(text, params.position);
+    const typeContextEarly = isTypeContext(text, params.position);
+    // Space is registered as a trigger only to surface match-subject completions.
+    // If the trigger was a space but we're not in a match-subject position, bail
+    // immediately so we don't flood normal typing with unwanted suggestions.
+    if (triggerChar === " " && !matchSubject && !typeContextEarly) {
+        return [];
+    }
+    if (matchSubject) {
+        const owner = getExportAtPosition(parsed, params.position);
+        const items = [];
+        for (const prop of (owner && owner.props) || []) {
+            if (matchSubject.partial !== "" && matchSubject.partial !== undefined && !prop.name.startsWith(matchSubject.partial)) {
+                continue;
+            }
+            const baseType = prop.type.replace(/^\?/, "").replace(/\[\]$/, "").split(/\s*\|\s*/)[0].trim();
+            const enumExport = resolveImportedSymbol(parsed, baseType);
+            if (!enumExport || enumExport.kind !== "enum" || !(enumExport.members || []).length) {
+                continue;
+            }
+            const ind = detectIndent(text);
+            const arms = enumExport.members.map((m, i) => `${ind}${enumExport.name}.${m.name} -> "\$${i + 1}"`);
+            arms.push(`${ind}default -> "$0"`);
+            const newText = `match (${prop.name}) {\n${arms.join(",\n")}\n}`;
+            items.push({
+                label: `match (${prop.name}) { … }`,
+                filterText: `match ${prop.name}`,
+                kind: CompletionItemKind.Value,
+                detail: `Match on ${enumExport.name} — ${enumExport.members.length} arms`,
+                textEdit: {
+                    range: { start: positionAt(text, matchSubject.matchStart), end: params.position },
+                    newText
+                },
+                insertTextFormat: InsertTextFormat.Snippet,
+                insertTextMode: InsertTextMode.adjustIndentation,
+                preselect: true,
+            });
+        }
+        if (items.length) return items;
+    }
+
     // ── Match arm autofill ─────────────────────────────────────────────────
     // Triggered right after `match (propName) {` or `match propName {`.
     // If the subject prop resolves to an enum, offer all members as arms.
@@ -1197,9 +1405,9 @@ connection.onCompletion((params) => {
             if (enumExport && enumExport.kind === "enum" && (enumExport.members || []).length > 0) {
                 return [{
                     label: `${enumExport.name} arms`,
-                    kind: CompletionItemKind.Snippet,
+                    kind: CompletionItemKind.Value,
                     detail: `All ${enumExport.members.length} ${enumExport.name} members + default`,
-                    insertText: buildMatchArmsSnippet(enumExport),
+                    insertText: buildMatchArmsSnippet(enumExport, detectIndent(text)),
                     insertTextFormat: InsertTextFormat.Snippet,
                     insertTextMode: InsertTextMode.adjustIndentation,
                     preselect: true,
@@ -1209,7 +1417,7 @@ connection.onCompletion((params) => {
         // No enum resolved — offer a generic match arms skeleton
         return [{
             label: "match arms",
-            kind: CompletionItemKind.Snippet,
+            kind: CompletionItemKind.Value,
             detail: "Generic match arm skeleton",
             insertText: "  $1 -> $2,\n  default -> $0\n",
             insertTextFormat: InsertTextFormat.Snippet,
@@ -1238,7 +1446,7 @@ connection.onCompletion((params) => {
     const tagContext = isTagContext(text, params.position);
     const closingTagContext = isClosingTagContext(text, params.position);
     const openTagContext = getOpenTagContext(text, params.position);
-    const typeContext = isTypeContext(text, params.position);
+    const typeContext = typeContextEarly;
     const expressionContext = isExpressionContext(text, params.position);
 
     if (!tagContext && !typeContext && !expressionContext) {
@@ -1284,6 +1492,21 @@ connection.onCompletion((params) => {
         }
     }
 
+    if (typeContext) {
+        const primitives = ["string", "number", "boolean", "slot"];
+        for (const prim of primitives) {
+            if (word && !prim.startsWith(word.toLowerCase())) continue;
+            items.push({
+                label: prim,
+                kind: CompletionItemKind.TypeParameter,
+                detail: "Primitive type",
+                insertText: prim,
+                insertTextFormat: InsertTextFormat.PlainText,
+                sortText: `0_${prim}`
+            });
+        }
+    }
+
     if (tagContext || typeContext) {
         if (tagContext) {
             for (const candidate of localComponentCandidates(parsed)) {
@@ -1311,6 +1534,10 @@ connection.onCompletion((params) => {
                 continue;
             }
 
+            const autoImportEdit = [{
+                range: Range.create(importInsertPosition(parsed), importInsertPosition(parsed)),
+                newText: `from "${candidate.source}" import { ${candidate.name} }\n`
+            }];
             items.push({
                 label: candidate.name,
                 kind: candidate.kind === "enum" ? CompletionItemKind.Enum : CompletionItemKind.Class,
@@ -1318,13 +1545,19 @@ connection.onCompletion((params) => {
                 insertText: tagContext ? buildComponentSnippet(candidate, closingTagContext) : candidate.name,
                 insertTextFormat: tagContext ? InsertTextFormat.Snippet : InsertTextFormat.PlainText,
                 insertTextMode: InsertTextMode.adjustIndentation,
-                additionalTextEdits: [
-                    {
-                        range: Range.create(importInsertPosition(parsed), importInsertPosition(parsed)),
-                        newText: `from "${candidate.source}" import { ${candidate.name} }\n`
-                    }
-                ]
+                additionalTextEdits: autoImportEdit
             });
+            // Only components can be used as collections (Type[])
+            if (typeContext && !tagContext && candidate.kind === "component") {
+                items.push({
+                    label: `${candidate.name}[]`,
+                    kind: CompletionItemKind.Class,
+                    detail: `Auto import component[] from ${candidate.source}`,
+                    insertText: `${candidate.name}[]`,
+                    insertTextFormat: InsertTextFormat.PlainText,
+                    additionalTextEdits: autoImportEdit
+                });
+            }
         }
     }
 

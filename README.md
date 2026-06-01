@@ -105,6 +105,8 @@ render match (status) {
 
 The enum members are read from the actual source — either defined locally or resolved through the import index. If the subject type cannot be resolved to a known enum, a generic two-arm skeleton is offered instead.
 
+The snippet uses the file's own indentation style (tabs or spaces) so the inserted arms always match your existing code.
+
 ---
 
 ## Error Checking
@@ -131,6 +133,12 @@ Any deviation from the CPX grammar is caught immediately:
 These are rules beyond pure syntax that the CPX build step enforces:
 
 - **String literal in a logic operation** — `message && "text"` is flagged. The `&&` and `||` operators require boolean-compatible operands; a string literal can never be used directly as one. The error points to the string literal.
+- **Primitive collection type** — `boolean[]`, `string[]`, `number[]`, and `slot[]` are not valid — only component and struct types support `[]`. The error points to the type.
+- **Undeclared prop reference** — A lowercase identifier used in a render expression (`match (columns)`, `{button}`, `item.field`) that is not declared as a prop on the enclosing component is flagged with a red squiggle. Deleting a prop declaration while it is still referenced in the render body immediately surfaces the error at every usage site.
+
+### Unused import warnings
+
+Imports that are never referenced in the file (not used as a component tag, prop type, or enum member access) are shown with reduced opacity and a yellow warning underline, matching the standard VS Code "unnecessary code" style. Partial unused imports — where only some names in a multi-name import are unused — are highlighted per-name rather than on the whole import line.
 
 ### What is NOT checked
 
