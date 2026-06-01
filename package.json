@@ -2,7 +2,7 @@
     "name": "component-engine-language-support",
     "displayName": "Component Engine (CPX) Language Support",
     "description": "Placeholder language support for Component Engine (CPX)",
-    "version": "0.0.2",
+    "version": "0.1.0",
     "publisher": "Devclaim",
     "license": "MIT",
     "repository": {
@@ -77,6 +77,9 @@
                     ],
                     "enum.declaration": [
                         "entity.name.type.class.js"
+                    ],
+                    "text": [
+                        "text.html"
                     ]
                 }
             }

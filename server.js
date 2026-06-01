@@ -2,6 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { parseCPX, parseCPXNodes } = require("./cpxParser.js");
 const {
     createConnection,
     TextDocuments,
@@ -14,7 +15,9 @@ const {
     MarkupKind,
     Location,
     Position,
-    Range
+    Range,
+    Diagnostic,
+    DiagnosticSeverity
 } = require("vscode-languageserver/node");
 const { TextDocument } = require("vscode-languageserver-textdocument");
 
@@ -25,7 +28,7 @@ const workspaceRoots = [];
 const documentIndex = new Map();
 const exportIndex = new Map();
 const semanticTokenLegend = {
-    tokenTypes: ["class", "enum"],
+    tokenTypes: ["class", "enum", "text"],
     tokenModifiers: ["declaration"]
 };
 
@@ -138,7 +141,7 @@ function parseExports(text) {
 
 function parseEnumMembers(blockText) {
     const members = [];
-    const memberRegex = /^\s*([A-Z][A-Z0-9_]*)(?:\(([^)]*)\))?\s*$/gm;
+    const memberRegex = /^\s*([A-Za-z_][A-Za-z0-9_]*)(?:\(([^)]*)\))?\s*$/gm;
     let match;
 
     while ((match = memberRegex.exec(blockText))) {
@@ -170,7 +173,7 @@ function findBlockEnd(text, blockStart) {
 
 function parsePropertyDeclarations(blockText, baseOffset = 0, fullText = blockText) {
     const props = [];
-    const propertyRegex = /^\s*([a-z][A-Za-z0-9_]*)\s*:\s*(\??(?:slot|boolean|string|number|[A-Z][A-Za-z0-9_]*)(?:\s*\|\s*\??(?:slot|boolean|string|number|[A-Z][A-Za-z0-9_]*))*)\s*$/gm;
+    const propertyRegex = /^\s*([a-z][A-Za-z0-9_]*)\s*:\s*(\??(?:slot|boolean|string|number|[A-Z][A-Za-z0-9_]*)(?:\[\])?(?:\s*\|\s*\??(?:slot|boolean|string|number|[A-Z][A-Za-z0-9_]*)(?:\[\])?)*)\s*$/gm;
     let match;
 
     while ((match = propertyRegex.exec(blockText))) {
@@ -234,7 +237,7 @@ function parseTypeUsages(text) {
 
 function parseEnumMemberUsages(text) {
     const usages = [];
-    const enumRegex = /\b([A-Z][A-Za-z0-9_]*)\.([A-Z][A-Z0-9_]*)\b/g;
+    const enumRegex = /\b([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
     let match;
 
     while ((match = enumRegex.exec(text))) {
@@ -367,7 +370,7 @@ function isInsideString(text, position) {
             continue;
         }
 
-        if ((char === "\"" || char === "'" || char === "`") && prev !== "\\") {
+        if (char === "\"" && prev !== "\\") {
             quote = char;
         }
     }
@@ -505,6 +508,41 @@ function getMemberAccessContext(text, position) {
         target: match[1],
         partial: match[2] || ""
     };
+}
+
+/**
+ * Detect if the cursor is at the opening of a match body and return the
+ * subject identifier so we can offer enum-aware arm completion.
+ *
+ * Matches patterns like:
+ *   match (propName) {         ← cursor here
+ *   match propName {           ← cursor here
+ *   match (prop.field) {       ← subject is prop.field
+ *
+ * Returns { subject: string } or null.
+ */
+function getMatchBodyContext(text, position) {
+    const offset = offsetAt(text, position);
+    const left = text.slice(0, offset);
+    // Accept optional whitespace/newlines after `{`
+    const m = left.match(/\bmatch\s*\(?\s*([\w.]+)\s*\)?\s*\{\s*$/);
+    if (!m) return null;
+    return { subject: m[1] };
+}
+
+/**
+ * Build a VSCode snippet for all arms of an enum, e.g.:
+ *
+ *   Status.ACTIVE -> $1,
+ *   Status.INACTIVE -> $2,
+ *   default -> $0
+ */
+function buildMatchArmsSnippet(enumExport) {
+    const name = enumExport.name;
+    const members = enumExport.members || [];
+    const lines = members.map((m, i) => `  ${name}.${m.name} -> $${i + 1}`);
+    lines.push("  default -> $0");
+    return lines.join(",\n") + "\n";
 }
 
 function isExpressionContext(text, position) {
@@ -767,13 +805,22 @@ function tokenTypeIndex(kind) {
     return semanticTokenLegend.tokenTypes.indexOf(kind === "enum" ? "enum" : "class");
 }
 
+const TEXT_TOKEN_TYPE = 2; // index of "text" in semanticTokenLegend.tokenTypes
+
 function collectSemanticTokens(parsed) {
-    const builder = new SemanticTokensBuilder();
     const tokenKinds = new Map();
+    // Collect all tokens as plain objects first so we can sort before building.
+    // SemanticTokensBuilder requires strict document order (line asc, char asc).
+    /** @type {Array<[number, number, number, number, number]>} */
+    const tokens = [];
+
+    function pushToken(line, char, length, type, mod) {
+        if (length > 0) tokens.push([line, char, length, type, mod]);
+    }
 
     for (const exported of parsed.exports) {
         tokenKinds.set(exported.name, exported.kind);
-        builder.push(
+        pushToken(
             exported.range.start.line,
             exported.range.start.character,
             exported.range.end.character - exported.range.start.character,
@@ -789,7 +836,7 @@ function collectSemanticTokens(parsed) {
             const exported = target && target.exports.find((entry) => entry.name === importedName.name);
             const kind = exported ? exported.kind : "component";
             tokenKinds.set(importedName.name, kind);
-            builder.push(
+            pushToken(
                 importedName.range.start.line,
                 importedName.range.start.character,
                 importedName.range.end.character - importedName.range.start.character,
@@ -801,7 +848,7 @@ function collectSemanticTokens(parsed) {
 
     for (const usage of parsed.usages) {
         const kind = tokenKinds.get(usage.name) || (exportIndex.get(usage.name)?.[0]?.kind) || "component";
-        builder.push(
+        pushToken(
             usage.range.start.line,
             usage.range.start.character,
             usage.range.end.character - usage.range.start.character,
@@ -812,7 +859,7 @@ function collectSemanticTokens(parsed) {
 
     for (const usage of parsed.typeUsages) {
         const kind = tokenKinds.get(usage.name) || (exportIndex.get(usage.name)?.[0]?.kind) || "component";
-        builder.push(
+        pushToken(
             usage.range.start.line,
             usage.range.start.character,
             usage.range.end.character - usage.range.start.character,
@@ -821,7 +868,166 @@ function collectSemanticTokens(parsed) {
         );
     }
 
+    // Emit text-content tokens so the semantic layer overrides TextMate's
+    // expression coloring for literal text nodes inside tag children.
+    // parseCPXNodes re-parses but is synchronous and fast (<1ms for typical files).
+    const { textRanges } = parseCPXNodes(parsed.text);
+    const lines = parsed.text.split(/\r?\n/);
+    for (const r of textRanges) {
+        // A text node may span multiple lines — emit one token per line.
+        for (let line = r.startLine; line <= r.endLine; line++) {
+            const startChar = line === r.startLine ? r.startCol : 0;
+            const endChar = line === r.endLine ? r.endCol : (lines[line] || "").length;
+            pushToken(line, startChar, endChar - startChar, TEXT_TOKEN_TYPE, 0);
+        }
+    }
+
+    // Sort into document order before feeding to the builder
+    tokens.sort((a, b) => a[0] !== b[0] ? a[0] - b[0] : a[1] - b[1]);
+
+    const builder = new SemanticTokensBuilder();
+    for (const [line, char, length, type, mod] of tokens) {
+        builder.push(line, char, length, type, mod);
+    }
+
     return builder.build();
+}
+
+// ---------------------------------------------------------------------------
+// CPX parser validation via `cpx check` (component-engine CLI)
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the JS CPX parser and return LSP Diagnostics.
+ * Returns immediately (synchronous under the hood).
+ * @param {string} text
+ * @returns {import("vscode-languageserver").Diagnostic[]}
+ */
+function runCpxCheck(text) {
+    const errors = parseCPX(text);
+    return errors.map((e) => Diagnostic.create(
+        Range.create(
+            Position.create(e.startLine, e.startCol),
+            Position.create(e.endLine, e.endCol)
+        ),
+        e.message,
+        DiagnosticSeverity.Error,
+        undefined,
+        "cpx"
+    ));
+}
+
+// ---------------------------------------------------------------------------
+
+const PRIMITIVE_TYPES = new Set(["boolean", "string", "number", "slot"]);
+
+function validateDocument(parsed) {
+    const diagnostics = [];
+
+    // 1. Import paths and exported names
+    for (const importEntry of parsed.imports) {
+        const resolved = resolveImportPath(parsed.path, importEntry.source);
+        if (resolved === null) {
+            continue; // non-relative import, skip
+        }
+
+        if (!fs.existsSync(resolved)) {
+            diagnostics.push(Diagnostic.create(
+                importEntry.sourceRange,
+                `Cannot find file "${importEntry.source}"`,
+                DiagnosticSeverity.Error,
+                undefined,
+                "cpx"
+            ));
+            continue;
+        }
+
+        let target = documentIndex.get(normalizePath(resolved));
+        if (!target) {
+            target = refreshDocumentFromDisk(resolved);
+        }
+
+        if (target) {
+            for (const name of importEntry.names) {
+                if (!target.exports.find((e) => e.name === name.name)) {
+                    diagnostics.push(Diagnostic.create(
+                        name.range,
+                        `"${name.name}" is not exported from "${importEntry.source}"`,
+                        DiagnosticSeverity.Error,
+                        undefined,
+                        "cpx"
+                    ));
+                }
+            }
+        }
+    }
+
+    // 2. Component tag usages — must be imported or locally declared
+    for (const usage of parsed.usages) {
+        if (!resolveImportedSymbol(parsed, usage.name)) {
+            diagnostics.push(Diagnostic.create(
+                usage.range,
+                `"${usage.name}" is not imported or declared`,
+                DiagnosticSeverity.Warning,
+                undefined,
+                "cpx"
+            ));
+        }
+    }
+
+    // 3. Type usages in property declarations — must be imported or locally declared
+    for (const usage of parsed.typeUsages) {
+        if (PRIMITIVE_TYPES.has(usage.name.toLowerCase())) {
+            continue;
+        }
+        if (!resolveImportedSymbol(parsed, usage.name)) {
+            diagnostics.push(Diagnostic.create(
+                usage.range,
+                `Type "${usage.name}" is not imported or declared`,
+                DiagnosticSeverity.Warning,
+                undefined,
+                "cpx"
+            ));
+        }
+    }
+
+    // 4. Components must have a render block
+    for (const exported of parsed.exports) {
+        if (exported.kind !== "component") {
+            continue;
+        }
+        const startOffset = offsetAt(parsed.text, exported.bodyRange.start);
+        const endOffset = offsetAt(parsed.text, exported.bodyRange.end);
+        const bodyText = parsed.text.slice(startOffset, endOffset);
+        if (!/\brender\b/.test(bodyText)) {
+            diagnostics.push(Diagnostic.create(
+                exported.range,
+                `Component "${exported.name}" is missing a render block`,
+                DiagnosticSeverity.Error,
+                undefined,
+                "cpx"
+            ));
+        }
+    }
+
+    return diagnostics;
+}
+
+function validateAndPublish(uri, parsed) {
+    if (!parsed) {
+        connection.sendDiagnostics({ uri, diagnostics: [] });
+        return;
+    }
+
+    const parserDiagnostics = runCpxCheck(parsed.text);
+    const semanticDiagnostics = parserDiagnostics.length === 0
+        ? validateDocument(parsed)   // only run semantic checks when syntax is clean
+        : [];
+
+    connection.sendDiagnostics({
+        uri,
+        diagnostics: [...parserDiagnostics, ...semanticDiagnostics],
+    });
 }
 
 connection.onInitialize(async (params) => {
@@ -854,6 +1060,7 @@ documents.onDidOpen((event) => {
     const fsPath = toFsPath(event.document.uri);
     if (fsPath) {
         indexDocument(fsPath, event.document.getText());
+        validateAndPublish(event.document.uri, getDocumentData(event.document.uri));
     }
 });
 
@@ -861,6 +1068,7 @@ documents.onDidChangeContent((event) => {
     const fsPath = toFsPath(event.document.uri);
     if (fsPath) {
         indexDocument(fsPath, event.document.getText());
+        validateAndPublish(event.document.uri, getDocumentData(event.document.uri));
     }
 });
 
@@ -868,7 +1076,12 @@ documents.onDidSave((event) => {
     const fsPath = toFsPath(event.document.uri);
     if (fsPath) {
         indexDocument(fsPath, event.document.getText());
+        validateAndPublish(event.document.uri, getDocumentData(event.document.uri));
     }
+});
+
+documents.onDidClose((event) => {
+    connection.sendDiagnostics({ uri: event.document.uri, diagnostics: [] });
 });
 
 connection.onDidChangeWatchedFiles(async () => {
@@ -966,6 +1179,42 @@ connection.onCompletion((params) => {
     const text = parsed.text;
     if (isInsideString(text, params.position)) {
         return [];
+    }
+
+    // ── Match arm autofill ─────────────────────────────────────────────────
+    // Triggered right after `match (propName) {` or `match propName {`.
+    // If the subject prop resolves to an enum, offer all members as arms.
+    const matchBody = getMatchBodyContext(text, params.position);
+    if (matchBody) {
+        const owner = getExportAtPosition(parsed, params.position);
+        // Resolve the subject — could be a direct prop name or a dotted path
+        const rootName = matchBody.subject.split(".")[0];
+        const prop = owner && owner.props && owner.props.find((p) => p.name === rootName);
+        if (prop) {
+            // Strip optional marker and array suffix to get the base type name
+            const baseType = prop.type.replace(/^\?/, "").replace(/\[\]$/, "").split(/\s*\|\s*/)[0].trim();
+            const enumExport = resolveImportedSymbol(parsed, baseType);
+            if (enumExport && enumExport.kind === "enum" && (enumExport.members || []).length > 0) {
+                return [{
+                    label: `${enumExport.name} arms`,
+                    kind: CompletionItemKind.Snippet,
+                    detail: `All ${enumExport.members.length} ${enumExport.name} members + default`,
+                    insertText: buildMatchArmsSnippet(enumExport),
+                    insertTextFormat: InsertTextFormat.Snippet,
+                    insertTextMode: InsertTextMode.adjustIndentation,
+                    preselect: true,
+                }];
+            }
+        }
+        // No enum resolved — offer a generic match arms skeleton
+        return [{
+            label: "match arms",
+            kind: CompletionItemKind.Snippet,
+            detail: "Generic match arm skeleton",
+            insertText: "  $1 -> $2,\n  default -> $0\n",
+            insertTextFormat: InsertTextFormat.Snippet,
+            preselect: true,
+        }];
     }
 
     const memberAccess = getMemberAccessContext(text, params.position);
