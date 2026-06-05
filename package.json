@@ -2,7 +2,7 @@
     "name": "component-engine-language-support",
     "displayName": "Component Engine (CPX) Language Support",
     "description": "Placeholder language support for Component Engine (CPX)",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "publisher": "Devclaim",
     "license": "MIT",
     "repository": {
@@ -19,11 +19,14 @@
     "extensionDependencies": [
         "bradlc.vscode-tailwindcss"
     ],
-    "categories": ["Programming Languages"],
+    "categories": [
+        "Programming Languages"
+    ],
     "scripts": {
         "check": "node --check extension.js && node --check server.js && node cpxParser.test.js && node server.test.js"
     },
     "dependencies": {
+        "vscode-html-languageservice": "^5.6.2",
         "vscode-languageclient": "^9.0.1",
         "vscode-languageserver": "^9.0.1",
         "vscode-languageserver-textdocument": "^1.0.11"
@@ -46,8 +49,12 @@
         "languages": [
             {
                 "id": "cpx",
-                "aliases": ["CPX"],
-                "extensions": [".cpx"],
+                "aliases": [
+                    "CPX"
+                ],
+                "extensions": [
+                    ".cpx"
+                ],
                 "configuration": "./language-configuration.json"
             }
         ],

@@ -2,6 +2,22 @@
 
 All notable changes to the "cpx" extension will be documented in this file.
 
+## [0.3.0] - 2026-06-05
+
+### Completions
+
+- **Property snippet** — accepting a prop completion now inserts `propName={$1}` with cursor inside the braces; string/slot-typed props insert `propName="$1"` instead
+- **Instant value suggestions** — after accepting a prop snippet, the suggestion list opens immediately inside the braces without requiring an extra keystroke
+- **Attribute completions fixed** — prop suggestions on component tags were silently blocked inside component bodies due to a false positive in the expression context detector; this is now fixed for both self-closing and regular tags
+- **Auto-import enum values** — enum member completions in attribute values (e.g. `size={CopySize.SIZE_MD}`) now work even when the enum type is not yet imported; accepting a member inserts the `from "…" import { EnumType }` line automatically
+- **Match keyword triggers earlier** — match snippet suggestions now appear from `ma` onward, rather than requiring the full `match` keyword to be typed
+- **Focused match-body suggestions** — typing inside a `match` body only suggests the specific enum being matched on, keeping the list focused; other enum names are still available outside match bodies
+- **Nested match expressions** — completions and enum suggestions work correctly inside `{match (x) { … }}` expression blocks; attribute value context inside match arms no longer incorrectly inherits the match subject's enum restriction
+
+### Error Checking
+
+- **Class array string enforcement** — match arm values inside `class={[ … ]}` arrays must be strings; any arm that produces a tag (component or HTML element) is now flagged as an error, since class values are CSS class names and cannot be rendered elements
+
 ## [0.2.0] - 2026-06-01
 
 ### Error Checking

@@ -252,10 +252,35 @@ describe('isTagContext', () => {
 
 // ── getOpenTagContext ─────────────────────────────────────────────────────────
 
+function getOpenTagContext(text, position) {
+    const offset = offsetAt(text, position);
+    const left = text.slice(0, offset);
+    const tagStart = left.lastIndexOf('<');
+    if (tagStart === -1) return null;
+    const tail = left.slice(tagStart);
+    if (tail.startsWith('</') || tail.includes('>')) return null;
+    const match = tail.match(/^<([A-Z][A-Za-z0-9_]*)(?:\s+[^<>]*)?$/);
+    if (!match) return null;
+    const attrMatch = tail.match(/\s+([a-zA-Z_:][-a-zA-Z0-9_:.]*)?$/);
+    return { tagName: match[1], partialAttribute: attrMatch && attrMatch[1] ? attrMatch[1] : '' };
+}
+
+function getOpenHtmlTagContext(text, position) {
+    const offset = offsetAt(text, position);
+    const left = text.slice(0, offset);
+    const tagStart = left.lastIndexOf('<');
+    if (tagStart === -1) return null;
+    const tail = left.slice(tagStart);
+    if (tail.startsWith('</') || tail.includes('>')) return null;
+    const match = tail.match(/^<([a-z][a-zA-Z0-9-]*)(?:\s+[^<>]*)?$/);
+    if (!match) return null;
+    const attrMatch = tail.match(/\s+([a-zA-Z_:][-a-zA-Z0-9_:.]*)?$/);
+    return { tagName: match[1], partialAttribute: attrMatch && attrMatch[1] ? attrMatch[1] : '' };
+}
+
 describe('getOpenTagContext', () => {
     it('null when cursor is just after <', () => {
         const t = 'render <';
-        // < alone has no tag name yet
         assertNull(getOpenTagContext(t, end(t)));
     });
 
@@ -282,6 +307,97 @@ describe('getOpenTagContext', () => {
     it('null for a closing tag', () => {
         const t = '</Foo';
         assertNull(getOpenTagContext(t, end(t)));
+    });
+
+    it('no-space: tag name absorbed into tagName, partial empty (recovery done in handler)', () => {
+        // Without space, the regex absorbs all chars into tagName.
+        // The completion handler recovers by stripping trailing lowercase.
+        const t = '<Copycl';
+        const ctx = getOpenTagContext(t, end(t));
+        assert(ctx);
+        assertEqual(ctx.tagName, 'Copycl'); // handler will split against index
+        assertEqual(ctx.partialAttribute, '');
+    });
+});
+
+describe('getOpenHtmlTagContext', () => {
+    it('returns tag name inside <div ', () => {
+        const t = '<div ';
+        const ctx = getOpenHtmlTagContext(t, end(t));
+        assert(ctx);
+        assertEqual(ctx.tagName, 'div');
+        assertEqual(ctx.partialAttribute, '');
+    });
+
+    it('returns partialAttribute when typing', () => {
+        const t = '<div cl';
+        const ctx = getOpenHtmlTagContext(t, end(t));
+        assert(ctx);
+        assertEqual(ctx.partialAttribute, 'cl');
+    });
+
+    it('null for PascalCase tag (handled by getOpenTagContext)', () => {
+        const t = '<Foo ';
+        assertNull(getOpenHtmlTagContext(t, end(t)));
+    });
+
+    it('null after >', () => {
+        const t = '<div class="x">';
+        assertNull(getOpenHtmlTagContext(t, end(t)));
+    });
+});
+
+// ── getAttributeValueContext ──────────────────────────────────────────────────
+
+function getAttributeValueContext(text, position) {
+    const offset = offsetAt(text, position);
+    const left = text.slice(0, offset);
+    const attrValueMatch = /([a-zA-Z_][-a-zA-Z0-9_]*)\s*=\s*\{[^}]*$/.exec(left);
+    if (!attrValueMatch) return null;
+    const tagStart = left.lastIndexOf('<');
+    if (tagStart === -1) return null;
+    const tail = left.slice(tagStart);
+    if (tail.startsWith('</') || tail.includes('>')) return null;
+    const tagMatch = tail.match(/^<([A-Z][A-Za-z0-9_]*)/);
+    if (!tagMatch) return null;
+    return { tagName: tagMatch[1], attrName: attrValueMatch[1] };
+}
+
+describe('getAttributeValueContext', () => {
+    it('detects tag name and attr name inside ={', () => {
+        const t = '<Headline tag={';
+        const ctx = getAttributeValueContext(t, end(t));
+        assert(ctx, 'expected context');
+        assertEqual(ctx.tagName, 'Headline');
+        assertEqual(ctx.attrName, 'tag');
+    });
+
+    it('null when not inside a {', () => {
+        const t = '<Headline tag=';
+        assertNull(getAttributeValueContext(t, end(t)));
+    });
+
+    it('null after brace is closed', () => {
+        const t = '<Headline tag={Foo} ';
+        assertNull(getAttributeValueContext(t, end(t)));
+    });
+
+    it('null outside any tag', () => {
+        const t = 'render {foo';
+        assertNull(getAttributeValueContext(t, end(t)));
+    });
+
+    it('null for lowercase tag', () => {
+        const t = '<div class={';
+        assertNull(getAttributeValueContext(t, end(t)));
+    });
+
+    it('works with multiline tag', () => {
+        const t = '<Headline\n    content={';
+        const ctx = getAttributeValueContext(t, end(t));
+        assert(ctx);
+        assertEqual(ctx.tagName, 'Headline');
+        assertEqual(ctx.attrName, 'content');
     });
 });
 
@@ -600,6 +716,267 @@ describe('prop identifier usage validation', () => {
         // "Accordion.cpx" must not make "accordion" appear as a used identifier
         const t = `from "../Accordion/Accordion.cpx" import { Accordion }\nexport component X {\n  render <div />\n}`;
         assertEqual(findUndeclaredProps(t).length, 0);
+    });
+});
+
+// ── parseAttributeValueEnumUsages ────────────────────────────────────────────
+
+function parseAttributeValueEnumUsages(text) {
+    const stripped = text.replace(/"[^"]*"/g, (m) => ' '.repeat(m.length));
+    const results = [];
+    const re = /([a-zA-Z_][-a-zA-Z0-9_]*)\s*=\s*\{\s*([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\}/g;
+    let m;
+    while ((m = re.exec(stripped))) {
+        const before = stripped.slice(0, m.index);
+        const tagStart = before.lastIndexOf('<');
+        if (tagStart === -1) continue;
+        const tagSlice = stripped.slice(tagStart);
+        const tagNameMatch = tagSlice.match(/^<([A-Z][A-Za-z0-9_]*)/);
+        if (!tagNameMatch) continue;
+        results.push({
+            tagName: tagNameMatch[1],
+            attrName: m[1],
+            typeName: m[2],
+            memberName: m[3]
+        });
+    }
+    return results;
+}
+
+describe('parseAttributeValueEnumUsages', () => {
+    it('detects single enum attribute', () => {
+        const t = `render <Headline tag={HeadlineTag.TAG_H2} />`;
+        const r = parseAttributeValueEnumUsages(t);
+        assertEqual(r.length, 1);
+        assertEqual(r[0].tagName, 'Headline');
+        assertEqual(r[0].attrName, 'tag');
+        assertEqual(r[0].typeName, 'HeadlineTag');
+        assertEqual(r[0].memberName, 'TAG_H2');
+    });
+
+    it('detects multiple enum attributes on one tag', () => {
+        const t = `render <Headline tag={HeadlineTag.TAG_H2} size={HeadlineSize.SIZE_LG} />`;
+        const r = parseAttributeValueEnumUsages(t);
+        assertEqual(r.length, 2);
+        assertEqual(r[0].typeName, 'HeadlineTag');
+        assertEqual(r[1].typeName, 'HeadlineSize');
+    });
+
+    it('ignores lowercase tags (HTML elements)', () => {
+        const t = `render <div class={Foo.BAR} />`;
+        const r = parseAttributeValueEnumUsages(t);
+        assertEqual(r.length, 0);
+    });
+
+    it('ignores string literals that look like enum access', () => {
+        const t = `render <Headline tag="HeadlineTag.TAG_H2" />`;
+        const r = parseAttributeValueEnumUsages(t);
+        assertEqual(r.length, 0);
+    });
+
+    it('ignores prop references (non-enum brace values)', () => {
+        const t = `render <Headline content={headline} />`;
+        const r = parseAttributeValueEnumUsages(t);
+        assertEqual(r.length, 0);
+    });
+
+    it('handles multiline tag', () => {
+        const t = `render\n  <Headline\n    tag={HeadlineTag.TAG_H2}\n  />`;
+        const r = parseAttributeValueEnumUsages(t);
+        assertEqual(r.length, 1);
+        assertEqual(r[0].tagName, 'Headline');
+        assertEqual(r[0].memberName, 'TAG_H2');
+    });
+});
+
+// ── getPascalMemberAccessContext ──────────────────────────────────────────────
+
+function getPascalMemberAccessContext(text, position) {
+    const offset = offsetAt(text, position);
+    const left = text.slice(0, offset);
+    const match = left.match(/\b([A-Z][A-Za-z0-9_]*)\.([A-Za-z0-9_]*)$/);
+    if (!match) return null;
+    return { typeName: match[1], partial: match[2] || '' };
+}
+
+describe('getPascalMemberAccessContext', () => {
+    it('detects PascalCase. with no partial', () => {
+        const t = 'HeadlineTag.';
+        const ctx = getPascalMemberAccessContext(t, end(t));
+        assert(ctx);
+        assertEqual(ctx.typeName, 'HeadlineTag');
+        assertEqual(ctx.partial, '');
+    });
+
+    it('detects PascalCase.PARTIAL', () => {
+        const t = 'HeadlineTag.TAG_H';
+        const ctx = getPascalMemberAccessContext(t, end(t));
+        assert(ctx);
+        assertEqual(ctx.typeName, 'HeadlineTag');
+        assertEqual(ctx.partial, 'TAG_H');
+    });
+
+    it('null for lowercase.member (struct access)', () => {
+        const t = 'item.field';
+        assertNull(getPascalMemberAccessContext(t, end(t)));
+    });
+
+    it('null when cursor is on PascalCase itself (before dot)', () => {
+        const t = 'HeadlineTag';
+        assertNull(getPascalMemberAccessContext(t, end(t)));
+    });
+
+    it('works inside match arm', () => {
+        const t = 'match (v) {\n  TextColumns.';
+        const ctx = getPascalMemberAccessContext(t, end(t));
+        assert(ctx);
+        assertEqual(ctx.typeName, 'TextColumns');
+    });
+
+    it('works inside attribute value braces', () => {
+        const t = '<Headline tag={HeadlineTag.';
+        const ctx = getPascalMemberAccessContext(t, end(t));
+        assert(ctx);
+        assertEqual(ctx.typeName, 'HeadlineTag');
+    });
+});
+
+// ── parseAttributeValueLiteralUsages ─────────────────────────────────────────
+
+function findEnclosingPascalTag(text, offset) {
+    const before = text.slice(0, offset);
+    const tagStart = before.lastIndexOf('<');
+    if (tagStart === -1) return null;
+    const tagSlice = text.slice(tagStart);
+    const tagNameMatch = tagSlice.match(/^<([A-Z][A-Za-z0-9_]*)/);
+    return tagNameMatch ? tagNameMatch[1] : null;
+}
+
+function parseAttributeValueLiteralUsages(text) {
+    const results = [];
+
+    function push(tagName, attrName, literalType, matchIndex, matchStr) {
+        const valueStart = matchIndex + matchStr.search(/[{"]/);
+        results.push({ tagName, attrName, literalType, valueStart, valueEnd: matchIndex + matchStr.length });
+    }
+
+    let m;
+    const braceStringRe = /([a-zA-Z_][-a-zA-Z0-9_]*)\s*=\s*\{"[^"]*"\}/g;
+    while ((m = braceStringRe.exec(text))) {
+        const tagName = findEnclosingPascalTag(text, m.index);
+        if (!tagName) continue;
+        push(tagName, m[1], 'string', m.index, m[0]);
+    }
+
+    const braceLiteralRe = /([a-zA-Z_][-a-zA-Z0-9_]*)\s*=\s*\{(true|false|null|0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+(?:\.\d+)?)\}/g;
+    while ((m = braceLiteralRe.exec(text))) {
+        const tagName = findEnclosingPascalTag(text, m.index);
+        if (!tagName) continue;
+        const literal = m[2];
+        const literalType = (literal === 'true' || literal === 'false') ? 'boolean'
+            : literal === 'null' ? 'null' : 'number';
+        push(tagName, m[1], literalType, m.index, m[0]);
+    }
+
+    const bareStringRe = /([a-zA-Z_][-a-zA-Z0-9_]*)\s*=\s*"[^"]*"/g;
+    while ((m = bareStringRe.exec(text))) {
+        const tagName = findEnclosingPascalTag(text, m.index);
+        if (!tagName) continue;
+        push(tagName, m[1], 'string', m.index, m[0]);
+    }
+
+    return results;
+}
+
+describe('parseAttributeValueLiteralUsages', () => {
+    it('detects brace-string literal', () => {
+        const t = `render <Headline tag={"fdsfd"} />`;
+        const r = parseAttributeValueLiteralUsages(t);
+        assertEqual(r.length, 1);
+        assertEqual(r[0].tagName, 'Headline');
+        assertEqual(r[0].attrName, 'tag');
+        assertEqual(r[0].literalType, 'string');
+    });
+
+    it('detects boolean literal', () => {
+        const t = `render <Button disabled={true} />`;
+        const r = parseAttributeValueLiteralUsages(t);
+        assertEqual(r.length, 1);
+        assertEqual(r[0].literalType, 'boolean');
+        assertEqual(r[0].attrName, 'disabled');
+    });
+
+    it('detects number literal', () => {
+        const t = `render <Grid columns={3} />`;
+        const r = parseAttributeValueLiteralUsages(t);
+        assertEqual(r.length, 1);
+        assertEqual(r[0].literalType, 'number');
+    });
+
+    it('detects bare string attribute', () => {
+        const t = `render <ContentGrid componentName="Text" />`;
+        const r = parseAttributeValueLiteralUsages(t);
+        assertEqual(r.length, 1);
+        assertEqual(r[0].tagName, 'ContentGrid');
+        assertEqual(r[0].attrName, 'componentName');
+        assertEqual(r[0].literalType, 'string');
+    });
+
+    it('ignores literals on lowercase HTML tags', () => {
+        const t = `render <div class={"foo"} />`;
+        const r = parseAttributeValueLiteralUsages(t);
+        assertEqual(r.length, 0);
+    });
+
+    it('ignores enum member values (not literals)', () => {
+        const t = `render <Headline tag={HeadlineTag.TAG_H2} />`;
+        const r = parseAttributeValueLiteralUsages(t);
+        assertEqual(r.length, 0);
+    });
+
+    it('ignores prop reference values', () => {
+        const t = `render <Headline content={headline} />`;
+        const r = parseAttributeValueLiteralUsages(t);
+        assertEqual(r.length, 0);
+    });
+
+    it('detects hex number literal', () => {
+        const t = `render <Foo color={0xFF0000} />`;
+        const r = parseAttributeValueLiteralUsages(t);
+        assertEqual(r.length, 1);
+        assertEqual(r[0].literalType, 'number');
+    });
+});
+
+describe('slot accepts string literals', () => {
+    const LITERAL_COMPATIBLE = {
+        string:  ['string', 'slot'],
+        boolean: ['boolean'],
+        number:  ['number', 'integer'],
+        null:    []
+    };
+    function isLiteralCompatible(propType, literalType) {
+        const typeComponents = propType
+            .split('|')
+            .map(t => t.trim().replace(/^\?/, '').replace(/\[\]$/, '').toLowerCase());
+        const compatible = LITERAL_COMPATIBLE[literalType] || [];
+        return typeComponents.some(t => compatible.includes(t));
+    }
+
+    it('string literal is compatible with slot', () => {
+        assert(isLiteralCompatible('slot', 'string'));
+    });
+
+    it('string literal is compatible with string|slot union', () => {
+        assert(isLiteralCompatible('string | slot', 'string'));
+    });
+
+    it('string literal is NOT compatible with HeadlineTag', () => {
+        assert(!isLiteralCompatible('HeadlineTag', 'string'));
+    });
+
+    it('boolean literal is NOT compatible with slot', () => {
+        assert(!isLiteralCompatible('slot', 'boolean'));
     });
 });
 

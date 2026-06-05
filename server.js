@@ -3,6 +3,8 @@
 const fs = require("fs");
 const path = require("path");
 const { parseCPX, parseCPXNodes } = require("./cpxParser.js");
+const { getLanguageService: getHtmlLanguageService } = require("vscode-html-languageservice");
+const htmlService = getHtmlLanguageService();
 const {
     createConnection,
     TextDocuments,
@@ -312,6 +314,140 @@ function parseEnumMemberUsages(text) {
     return usages;
 }
 
+/**
+ * Scan backwards from `offset` in `text` to find the nearest opening PascalCase
+ * tag name (e.g. `Headline` in `<Headline `). Returns null if none found or if
+ * the nearest `<` starts a lowercase/closing tag.
+ */
+function findEnclosingPascalTag(text, offset) {
+    const before = text.slice(0, offset);
+    const tagStart = before.lastIndexOf('<');
+    if (tagStart === -1) return null;
+    const tagSlice = text.slice(tagStart);
+    const tagNameMatch = tagSlice.match(/^<([A-Z][A-Za-z0-9_]*)/);
+    return tagNameMatch ? tagNameMatch[1] : null;
+}
+
+/**
+ * Finds every `attrName={EnumType.MEMBER}` expression inside PascalCase tag
+ * attribute positions. Returns [{tagName, attrName, typeName, memberName,
+ * typeRange, memberRange}].
+ */
+function parseAttributeValueEnumUsages(text) {
+    // Strip string literals so paths like "Foo.cpx" don't match
+    const stripped = text.replace(/"[^"]*"/g, (m) => ' '.repeat(m.length));
+    const results = [];
+    const re = /([a-zA-Z_][-a-zA-Z0-9_]*)\s*=\s*\{\s*([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\}/g;
+    let m;
+    while ((m = re.exec(stripped))) {
+        const tagName = findEnclosingPascalTag(stripped, m.index);
+        if (!tagName) continue;
+
+        const attrName = m[1];
+        const typeName = m[2];
+        const memberName = m[3];
+        const typeOffset = m.index + m[0].indexOf(typeName);
+        const memberOffset = m.index + m[0].lastIndexOf(memberName);
+
+        results.push({
+            tagName,
+            attrName,
+            typeName,
+            memberName,
+            typeRange: makeRange(text, typeOffset, typeOffset + typeName.length),
+            memberRange: makeRange(text, memberOffset, memberOffset + memberName.length)
+        });
+    }
+    return results;
+}
+
+/**
+ * Finds attribute values that are raw literals (string, boolean, number) on
+ * PascalCase component tags. Covers both brace syntax `attr={"val"}` /
+ * `attr={true}` and bare string syntax `attr="val"`.
+ * Returns [{tagName, attrName, literalType, valueRange}].
+ */
+function parseAttributeValueLiteralUsages(text) {
+    const results = [];
+
+    function push(tagName, attrName, literalType, matchIndex, matchStr) {
+        // Highlight from the `{` (or `"`) to end of match
+        const valueStart = matchIndex + matchStr.search(/[{"]/);
+        results.push({
+            tagName, attrName, literalType,
+            valueRange: makeRange(text, valueStart, matchIndex + matchStr.length)
+        });
+    }
+
+    let m;
+
+    // Brace-wrapped string literal: attr={"..."}
+    const braceStringRe = /([a-zA-Z_][-a-zA-Z0-9_]*)\s*=\s*\{"[^"]*"\}/g;
+    while ((m = braceStringRe.exec(text))) {
+        const tagName = findEnclosingPascalTag(text, m.index);
+        if (!tagName) continue;
+        push(tagName, m[1], 'string', m.index, m[0]);
+    }
+
+    // Brace-wrapped boolean / number literal: attr={true}, attr={42}, attr={0xFF}
+    const braceLiteralRe = /([a-zA-Z_][-a-zA-Z0-9_]*)\s*=\s*\{(true|false|null|0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+(?:\.\d+)?)\}/g;
+    while ((m = braceLiteralRe.exec(text))) {
+        const tagName = findEnclosingPascalTag(text, m.index);
+        if (!tagName) continue;
+        const literal = m[2];
+        const literalType = (literal === 'true' || literal === 'false') ? 'boolean'
+            : literal === 'null' ? 'null'
+            : 'number';
+        push(tagName, m[1], literalType, m.index, m[0]);
+    }
+
+    // Bare string attribute: attr="..." (no braces)
+    const bareStringRe = /([a-zA-Z_][-a-zA-Z0-9_]*)\s*=\s*"[^"]*"/g;
+    while ((m = bareStringRe.exec(text))) {
+        const tagName = findEnclosingPascalTag(text, m.index);
+        if (!tagName) continue;
+        push(tagName, m[1], 'string', m.index, m[0]);
+    }
+
+    return results;
+}
+
+/**
+ * Inside `class={[ ... ]}` array expressions, every value must be a string.
+ * Returns [{range, message}] for any match arm whose value is a component tag.
+ *
+ * Strategy: find every `class={[` occurrence, extract the bracket contents with
+ * depth tracking, then scan for `-> <UpperCase` arm values inside.
+ */
+function parseClassArrayErrors(text) {
+    const results = [];
+    const classRe = /\bclass=\{\[/g;
+    let m;
+    while ((m = classRe.exec(text))) {
+        const start = m.index + m[0].length;
+        let depth = 1, i = start;
+        while (i < text.length && depth > 0) {
+            if (text[i] === '[') depth++;
+            else if (text[i] === ']') depth--;
+            i++;
+        }
+        const content = text.slice(start, i - 1);
+        const base = start;
+
+        // Any match arm whose value is a tag (component or HTML): -> <Tag
+        const armRe = /->\s*(<[A-Za-z][A-Za-z0-9_-]*)/g;
+        let arm;
+        while ((arm = armRe.exec(content))) {
+            const tagStart = base + arm.index + arm[0].indexOf('<');
+            results.push({
+                range: makeRange(text, tagStart, tagStart + arm[1].length),
+                message: 'Component tag is not valid here — class array values must be strings'
+            });
+        }
+    }
+    return results;
+}
+
 function indexDocument(fsPath, text) {
     const normalized = normalizePath(fsPath);
     const parsed = {
@@ -321,6 +457,8 @@ function indexDocument(fsPath, text) {
         usages: parseComponentUsages(text),
         typeUsages: parseTypeUsages(text),
         enumMemberUsages: parseEnumMemberUsages(text),
+        attrValueEnumUsages: parseAttributeValueEnumUsages(text),
+        attrValueLiteralUsages: parseAttributeValueLiteralUsages(text),
         text
     };
 
@@ -339,6 +477,7 @@ function indexDocument(fsPath, text) {
     for (const exported of parsed.exports) {
         const entries = exportIndex.get(exported.name) || [];
         entries.push({
+            name: exported.name,
             path: normalized,
             kind: exported.kind,
             props: exported.props,
@@ -482,6 +621,24 @@ function getOpenTagContext(text, position) {
     };
 }
 
+// HTML attribute completions are delegated to vscode-html-languageservice (see htmlService above).
+
+function getOpenHtmlTagContext(text, position) {
+    const offset = offsetAt(text, position);
+    const left = text.slice(0, offset);
+    const tagStart = left.lastIndexOf("<");
+    if (tagStart === -1) return null;
+    const tail = left.slice(tagStart);
+    if (tail.startsWith("</") || tail.includes(">")) return null;
+    const match = tail.match(/^<([a-z][a-zA-Z0-9-]*)(?:\s+[^<>]*)?$/);
+    if (!match) return null;
+    const attrMatch = tail.match(/\s+([a-zA-Z_:][-a-zA-Z0-9_:.]*)?$/);
+    return {
+        tagName: match[1],
+        partialAttribute: attrMatch && attrMatch[1] ? attrMatch[1] : ""
+    };
+}
+
 function buildComponentSnippet(candidate, closingTagContext) {
     if (closingTagContext) {
         return `${candidate.name}>`;
@@ -554,6 +711,68 @@ function getExportAtPosition(parsed, position) {
     return parsed.exports.find((entry) => isInsideRange(position, entry.bodyRange)) || null;
 }
 
+/**
+ * Returns { tagName, attrName } when the cursor is inside an attribute value
+ * expression: `<MyTag attrName={|`. Returns null otherwise.
+ */
+function getAttributeValueContext(text, position) {
+    const offset = offsetAt(text, position);
+    const left = text.slice(0, offset);
+
+    // Must be inside an open brace that's an attribute value: `attrname={...`
+    const attrValueMatch = /([a-zA-Z_][-a-zA-Z0-9_]*)\s*=\s*\{[^}]*$/.exec(left);
+    if (!attrValueMatch) return null;
+
+    // Confirm we're still inside an open tag (no `>` after the last `<`)
+    const tagStart = left.lastIndexOf('<');
+    if (tagStart === -1) return null;
+    const tail = left.slice(tagStart);
+    if (tail.startsWith('</') || tail.includes('>')) return null;
+    const tagMatch = tail.match(/^<([A-Z][A-Za-z0-9_]*)/);
+    if (!tagMatch) return null;
+
+    return { tagName: tagMatch[1], attrName: attrValueMatch[1] };
+}
+
+/**
+ * Returns { subject } when the cursor is anywhere inside a match body, where
+ * `subject` is the match expression (e.g. "columns" in `match (columns) { | }`).
+ * Works even when existing arms are present — uses brace-depth tracking.
+ * Use this for expression-context completions to restrict enum suggestions.
+ */
+function getActiveMatchContext(text, position) {
+    const offset = offsetAt(text, position);
+    const left = text.slice(0, offset);
+
+    // Find every `match (subject) {` in the text before the cursor
+    const matchRe = /\bmatch\s*\(?\s*([\w.]+)\s*\)?\s*\{/g;
+    let result = null;
+    let m;
+    while ((m = matchRe.exec(left))) {
+        const braceOpen = m.index + m[0].length - 1;
+        // Count net brace depth from this `{` to cursor — if still open, cursor is inside
+        let depth = 0;
+        for (let i = braceOpen; i < offset; i++) {
+            if (left[i] === '{') depth++;
+            else if (left[i] === '}') depth--;
+        }
+        if (depth > 0) result = { subject: m[1] };
+    }
+    return result;
+}
+
+/**
+ * Detects `PascalCase.` or `PascalCase.partial` at the cursor — the user is
+ * typing an enum member access. Returns { typeName, partial } or null.
+ */
+function getPascalMemberAccessContext(text, position) {
+    const offset = offsetAt(text, position);
+    const left = text.slice(0, offset);
+    const match = left.match(/\b([A-Z][A-Za-z0-9_]*)\.([A-Za-z0-9_]*)$/);
+    if (!match) return null;
+    return { typeName: match[1], partial: match[2] || '' };
+}
+
 function getMemberAccessContext(text, position) {
     const offset = offsetAt(text, position);
     const left = text.slice(0, offset);
@@ -576,12 +795,15 @@ function getMemberAccessContext(text, position) {
 function getMatchSubjectContext(text, position) {
     const offset = offsetAt(text, position);
     const left = text.slice(0, offset);
-    // `match` followed by optional whitespace + optional partial word, but no `{` yet.
-    // Space is not a trigger character so we also match right after the `match`
-    // keyword itself (zero spaces) so completions fire as the user finishes typing.
-    const m = left.match(/\bmatch(\s+([\w.]*))?$/);
+    // Fire as soon as the user starts typing the keyword: `mat`, `matc`, `match`,
+    // or `match propName`. The textEdit range always covers from the first letter
+    // to the cursor, so the snippet correctly replaces whatever has been typed.
+    const m = left.match(/\b(ma(?:t(?:ch?)?)?)(\s+([\w.]*))?$/);
     if (!m) return null;
-    return { partial: m[2] || "", matchStart: offset - m[0].length };
+    const keyword = m[1]; // 'ma', 'mat', 'matc', or 'match'
+    // Subject filtering only applies once the full keyword + space is present
+    const partial = (keyword === 'match' && m[3] !== undefined) ? m[3] : '';
+    return { partial, matchStart: offset - m[0].length };
 }
 
 /**
@@ -1164,6 +1386,104 @@ function validateDocument(parsed) {
         }
     }
 
+    // 8. Attribute value enum type checking
+    //    <MyTag attr={EnumType.MEMBER} /> — validate:
+    //    (a) EnumType is imported
+    //    (b) MEMBER exists on EnumType
+    //    (c) EnumType matches the declared prop type for attr
+    for (const usage of parsed.attrValueEnumUsages) {
+        const typeExport = resolveImportedSymbol(parsed, usage.typeName);
+        if (!typeExport) {
+            diagnostics.push(Diagnostic.create(
+                usage.typeRange,
+                `"${usage.typeName}" is not imported or declared`,
+                DiagnosticSeverity.Warning,
+                undefined,
+                "cpx"
+            ));
+            continue;
+        }
+
+        // Verify member exists
+        const complete = ensureCompleteExport(typeExport, parsed.path);
+        const members = (complete || typeExport).members || [];
+        if (members.length > 0 && !members.find((mb) => mb.name === usage.memberName)) {
+            diagnostics.push(Diagnostic.create(
+                usage.memberRange,
+                `"${usage.memberName}" is not a member of "${usage.typeName}"`,
+                DiagnosticSeverity.Error,
+                undefined,
+                "cpx"
+            ));
+        }
+
+        // Verify EnumType matches the declared prop type on the target component
+        const tagExport = resolveImportedSymbol(parsed, usage.tagName);
+        if (tagExport && tagExport.props) {
+            const prop = tagExport.props.find((p) => p.name === usage.attrName);
+            if (prop) {
+                const allowedTypes = prop.type
+                    .split('|')
+                    .map((t) => t.trim().replace(/^\?/, '').replace(/\[\]$/, ''))
+                    .filter((t) => /^[A-Z]/.test(t));
+                if (allowedTypes.length > 0 && !allowedTypes.includes(usage.typeName)) {
+                    diagnostics.push(Diagnostic.create(
+                        usage.typeRange,
+                        `Prop "${usage.attrName}" expects "${allowedTypes.join(' | ')}", not "${usage.typeName}"`,
+                        DiagnosticSeverity.Error,
+                        undefined,
+                        "cpx"
+                    ));
+                }
+            }
+        }
+    }
+
+    // 9. Attribute value literal type checking
+    //    <MyTag attr={"text"} /> or <MyTag attr="text" /> or <MyTag attr={true} />
+    //    — flag when the literal type doesn't match the declared prop type.
+    const LITERAL_COMPATIBLE = {
+        string:  ['string', 'slot'],  // slot accepts string literals as text content
+        boolean: ['boolean'],
+        number:  ['number', 'integer'],
+        null:    []  // null literal is never a valid prop value in CPX
+    };
+    for (const usage of parsed.attrValueLiteralUsages) {
+        const tagExport = resolveImportedSymbol(parsed, usage.tagName);
+        if (!tagExport || !tagExport.props) continue;
+
+        const prop = tagExport.props.find((p) => p.name === usage.attrName);
+        if (!prop) continue;
+
+        const typeComponents = prop.type
+            .split('|')
+            .map((t) => t.trim().replace(/^\?/, '').replace(/\[\]$/, '').toLowerCase());
+
+        const compatible = LITERAL_COMPATIBLE[usage.literalType] || [];
+        const isCompatible = typeComponents.some((t) => compatible.includes(t));
+
+        if (!isCompatible) {
+            diagnostics.push(Diagnostic.create(
+                usage.valueRange,
+                `Prop "${usage.attrName}" expects "${prop.type}", not a ${usage.literalType} literal`,
+                DiagnosticSeverity.Error,
+                undefined,
+                "cpx"
+            ));
+        }
+    }
+
+    // 10. class={[...]} arrays must contain only strings — component tags are invalid
+    for (const err of parseClassArrayErrors(parsed.text)) {
+        diagnostics.push(Diagnostic.create(
+            err.range,
+            err.message,
+            DiagnosticSeverity.Error,
+            undefined,
+            "cpx"
+        ));
+    }
+
     return diagnostics;
 }
 
@@ -1350,10 +1670,12 @@ connection.onCompletion((params) => {
     const triggerChar = params.context && params.context.triggerCharacter;
     const matchSubject = getMatchSubjectContext(text, params.position);
     const typeContextEarly = isTypeContext(text, params.position);
-    // Space is registered as a trigger only to surface match-subject completions.
-    // If the trigger was a space but we're not in a match-subject position, bail
-    // immediately so we don't flood normal typing with unwanted suggestions.
-    if (triggerChar === " " && !matchSubject && !typeContextEarly) {
+    const openTagContextEarly = getOpenTagContext(text, params.position);
+    const openHtmlTagContextEarly = getOpenHtmlTagContext(text, params.position);
+    // Space is registered as a trigger only to surface match-subject completions
+    // and attribute completions inside open tags. Bail for all other space triggers
+    // so we don't flood normal typing with unwanted suggestions.
+    if (triggerChar === " " && !matchSubject && !typeContextEarly && !openTagContextEarly && !openHtmlTagContextEarly) {
         return [];
     }
     if (matchSubject) {
@@ -1425,6 +1747,27 @@ connection.onCompletion((params) => {
         }];
     }
 
+    // PascalCase. → enum member completions (anywhere: match arms, attr values, expressions)
+    const pascalMemberAccess = getPascalMemberAccessContext(text, params.position);
+    if (pascalMemberAccess) {
+        const typeExport = resolveImportedSymbol(parsed, pascalMemberAccess.typeName);
+        if (typeExport && typeExport.kind === 'enum') {
+            const complete = ensureCompleteExport(typeExport, typeExport.path || parsed.path);
+            const members = (complete || typeExport).members || [];
+            return members
+                .filter((mb) => !pascalMemberAccess.partial || mb.name.toLowerCase().startsWith(pascalMemberAccess.partial.toLowerCase()))
+                .map((mb) => ({
+                    label: mb.name,
+                    kind: CompletionItemKind.EnumMember,
+                    detail: `${pascalMemberAccess.typeName}.${mb.name}`,
+                    insertText: mb.name,
+                    insertTextFormat: InsertTextFormat.PlainText
+                }));
+        }
+        // Cursor is at PascalCase. but it's not a known enum — no completions
+        return [];
+    }
+
     const memberAccess = getMemberAccessContext(text, params.position);
     if (memberAccess) {
         const structType = resolveStructForProperty(parsed, params.position, memberAccess.target);
@@ -1449,32 +1792,131 @@ connection.onCompletion((params) => {
     const typeContext = typeContextEarly;
     const expressionContext = isExpressionContext(text, params.position);
 
+    const openHtmlTagContext = openHtmlTagContextEarly;
+
     if (!tagContext && !typeContext && !expressionContext) {
-        if (!openTagContext) {
+        if (!openTagContext && !openHtmlTagContext) {
             return [];
         }
     }
 
     const items = [];
 
-    if (openTagContext && !tagContext && !closingTagContext) {
-        const resolved = resolveImportedSymbol(parsed, openTagContext.tagName);
+    // HTML element attribute completions — delegated to vscode-html-languageservice.
+    // It is element-aware: <a> gets href, <img> gets src/alt, etc.
+    // Note: expressionContext is always true inside a component body (the body `{` is unclosed),
+    // so we can't gate on !expressionContext — instead skip only when inside an attr value brace.
+    if (openHtmlTagContext && !tagContext && !closingTagContext && !getAttributeValueContext(text, params.position)) {
+        const htmlDoc = TextDocument.create(params.textDocument.uri, "html", 1, text);
+        const htmlParsed = htmlService.parseHTMLDocument(htmlDoc);
+        const result = htmlService.doComplete(htmlDoc, params.position, htmlParsed);
+        return result ? result.items : [];
+    }
+
+    // Component attribute-name completions — not inside a `{` value.
+    // expressionContext is always true inside a component body, so we check
+    // getAttributeValueContext instead: if cursor is in `attr={`, fall through
+    // to the expressionContext block; otherwise offer attribute names here.
+    if (openTagContext && !tagContext && !closingTagContext && !getAttributeValueContext(text, params.position)) {
+        let resolved = resolveImportedSymbol(parsed, openTagContext.tagName);
+        let partial = openTagContext.partialAttribute;
+
+        // No-space recovery: user typed directly onto tag name without a space,
+        // e.g. <Copycl → tagName='Copycl'. Strip trailing lowercase until we
+        // find a known component, accumulating the stripped chars as the partial.
+        if (!resolved) {
+            let tagName = openTagContext.tagName;
+            let stripped = '';
+            while (tagName.length > 1 && /[a-z0-9]/.test(tagName[tagName.length - 1])) {
+                stripped = tagName[tagName.length - 1] + stripped;
+                tagName = tagName.slice(0, -1);
+                const candidate = resolveImportedSymbol(parsed, tagName);
+                if (candidate && candidate.props) {
+                    resolved = candidate;
+                    partial = stripped;
+                    break;
+                }
+            }
+        }
+
         if (!resolved || !resolved.props) {
             return [];
         }
 
         return resolved.props
-            .filter((prop) => !openTagContext.partialAttribute || prop.name.toLowerCase().startsWith(openTagContext.partialAttribute.toLowerCase()))
-            .map((prop) => ({
-                label: prop.name,
-                kind: CompletionItemKind.Property,
-                detail: prop.type,
-                insertText: `${prop.name}=`,
-                insertTextFormat: InsertTextFormat.PlainText
-            }));
+            .filter((prop) => !partial || prop.name.toLowerCase().startsWith(partial.toLowerCase()))
+            .map((prop) => {
+                const baseType = prop.type.replace(/^\?/, '').replace(/\[\]$/, '').split(/\s*\|\s*/)[0].trim().toLowerCase();
+                const isString = baseType === 'string' || baseType === 'slot';
+                return {
+                    label: prop.name,
+                    kind: CompletionItemKind.Property,
+                    detail: prop.type,
+                    insertText: isString ? `${prop.name}="$1"` : `${prop.name}={$1}`,
+                    insertTextFormat: InsertTextFormat.Snippet,
+                    // Re-trigger suggestions immediately after the snippet is accepted
+                    // so enum/value options appear without the user having to type first.
+                    command: { command: 'editor.action.triggerSuggest', title: '' }
+                };
+            });
     }
 
     if (expressionContext) {
+        const attrValueCtx = getAttributeValueContext(text, params.position);
+
+        // Enum member suggestions for typed attribute values: tag={HeadlineTag.|}
+        // Works for both imported and not-yet-imported enum types — unimported ones
+        // get an auto-import additionalTextEdit injected.
+        if (attrValueCtx) {
+            const tagExport = resolveImportedSymbol(parsed, attrValueCtx.tagName);
+            if (tagExport && tagExport.props) {
+                const attrProp = tagExport.props.find((p) => p.name === attrValueCtx.attrName);
+                if (attrProp) {
+                    const typeNames = attrProp.type
+                        .split('|')
+                        .map((t) => t.trim().replace(/^\?/, '').replace(/\[\]$/, ''))
+                        .filter((t) => /^[A-Z]/.test(t));
+                    for (const typeName of typeNames) {
+                        const typeExport = resolveImportedSymbol(parsed, typeName);
+                        if (!typeExport) continue;
+                        // Use the enum's own file path so ensureCompleteExport reads
+                        // the right file — not the current document's path.
+                        const complete = ensureCompleteExport(typeExport, typeExport.path || parsed.path);
+                        const members = (complete || typeExport).members || [];
+                        if (members.length === 0) continue;
+
+                        // Build auto-import edit if the type is not yet imported
+                        const isImported = parsed.imports.some((e) => e.names.some((n) => n.name === typeName));
+                        const enumFilePath = typeExport.path;
+                        const autoImportEdits = (!isImported && enumFilePath) ? (() => {
+                            const rel = path.relative(path.dirname(parsed.path), enumFilePath).replace(/\\/g, '/');
+                            const src = rel.startsWith('.') ? rel : `./${rel}`;
+                            return [{
+                                range: Range.create(importInsertPosition(parsed), importInsertPosition(parsed)),
+                                newText: `from "${src}" import { ${typeName} }\n`
+                            }];
+                        })() : undefined;
+
+                        for (const member of members) {
+                            const label = `${typeName}.${member.name}`;
+                            if (word && !label.toLowerCase().startsWith(word.toLowerCase())) continue;
+                            const item = {
+                                label,
+                                kind: CompletionItemKind.EnumMember,
+                                detail: isImported ? `${typeName} member` : `${typeName} member — auto import`,
+                                insertText: label,
+                                insertTextFormat: InsertTextFormat.PlainText,
+                                sortText: `0_${label}`
+                            };
+                            if (autoImportEdits) item.additionalTextEdits = autoImportEdits;
+                            items.push(item);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prop name suggestions from the enclosing component
         const owner = getExportAtPosition(parsed, params.position);
         if (owner && owner.props) {
             for (const prop of owner.props) {
@@ -1488,6 +1930,51 @@ connection.onCompletion((params) => {
                     detail: prop.type,
                     insertText: prop.name
                 });
+            }
+        }
+
+        // Imported enum names — inside a match body, only suggest the match subject's
+        // enum so the list stays focused; elsewhere show all imported enums.
+        // Skip entirely when inside an attribute value brace — attrValueCtx already
+        // handled the right enum members, and we don't want match-subject pollution.
+        const activeMatch = !attrValueCtx && getActiveMatchContext(text, params.position);
+        if (activeMatch) {
+            // Restrict to the specific enum the match is over
+            const matchOwner = getExportAtPosition(parsed, params.position);
+            const rootName = activeMatch.subject.split('.')[0];
+            const subjectProp = matchOwner && matchOwner.props && matchOwner.props.find((p) => p.name === rootName);
+            if (subjectProp) {
+                const baseType = subjectProp.type.replace(/^\?/, '').replace(/\[\]$/, '').split(/\s*\|\s*/)[0].trim();
+                if (/^[A-Z]/.test(baseType)) {
+                    const enumExport = resolveImportedSymbol(parsed, baseType);
+                    if (enumExport && enumExport.kind === 'enum') {
+                        if (!word || baseType.toLowerCase().startsWith(word.toLowerCase())) {
+                            items.push({
+                                label: baseType,
+                                kind: CompletionItemKind.Enum,
+                                detail: 'Enum',
+                                insertText: baseType,
+                                insertTextFormat: InsertTextFormat.PlainText
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            // Not inside a match — show all imported enums (user can type e.g. "HeadlineT" → "HeadlineTag")
+            for (const importEntry of parsed.imports) {
+                for (const importedName of importEntry.names) {
+                    if (word && !importedName.name.toLowerCase().startsWith(word.toLowerCase())) continue;
+                    const resolved = resolveImportedSymbol(parsed, importedName.name);
+                    if (!resolved || resolved.kind !== 'enum') continue;
+                    items.push({
+                        label: importedName.name,
+                        kind: CompletionItemKind.Enum,
+                        detail: 'Enum',
+                        insertText: importedName.name,
+                        insertTextFormat: InsertTextFormat.PlainText
+                    });
+                }
             }
         }
     }
