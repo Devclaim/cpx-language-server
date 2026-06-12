@@ -2,7 +2,7 @@
     "name": "component-engine-language-support",
     "displayName": "Component Engine (CPX) Language Support",
     "description": "Placeholder language support for Component Engine (CPX)",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "publisher": "Devclaim",
     "license": "MIT",
     "repository": {

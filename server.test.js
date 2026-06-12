@@ -956,9 +956,12 @@ describe('slot accepts string literals', () => {
         null:    []
     };
     function isLiteralCompatible(propType, literalType) {
-        const typeComponents = propType
-            .split('|')
-            .map(t => t.trim().replace(/^\?/, '').replace(/\[\]$/, '').toLowerCase());
+        const rawComponents = propType.split('|').map(t => t.trim());
+        const typeComponents = rawComponents
+            .map(t => t.replace(/^\?/, '').replace(/\[\]$/, '').toLowerCase());
+        if (literalType === 'null') {
+            return rawComponents.some(t => t.startsWith('?')) || typeComponents.includes('null');
+        }
         const compatible = LITERAL_COMPATIBLE[literalType] || [];
         return typeComponents.some(t => compatible.includes(t));
     }
@@ -977,6 +980,198 @@ describe('slot accepts string literals', () => {
 
     it('boolean literal is NOT compatible with slot', () => {
         assert(!isLiteralCompatible('slot', 'boolean'));
+    });
+
+    it('null literal is compatible with optional ?number', () => {
+        assert(isLiteralCompatible('?number', 'null'));
+    });
+
+    it('null literal is compatible with optional union ?string | slot', () => {
+        assert(isLiteralCompatible('?string | slot', 'null'));
+    });
+
+    it('null literal is compatible with explicit null union', () => {
+        assert(isLiteralCompatible('string | null', 'null'));
+    });
+
+    it('null literal is NOT compatible with required number', () => {
+        assert(!isLiteralCompatible('number', 'null'));
+    });
+});
+
+// ── Package-aware import resolution (inlined from server.js) ─────────────────
+
+describe('package discovery & cross-package imports', () => {
+    const path = require('path');
+
+    function derivePackageKey(manifest) {
+        const explicit = manifest && manifest.extra && manifest.extra.neos && manifest.extra.neos['package-key'];
+        if (typeof explicit === 'string' && explicit.length > 0) return explicit;
+        const psr4 = manifest && manifest.autoload && manifest.autoload['psr-4'];
+        if (psr4) {
+            const namespaces = Object.keys(psr4).sort((a, b) => a.length - b.length);
+            if (namespaces.length > 0) return namespaces[0].replace(/\\+$/, '').replace(/\\/g, '.');
+        }
+        return null;
+    }
+
+    const packageIndex = new Map([
+        ['Sitegeist.PaperTiger.CPX', [
+            {
+                root: '/dist/Packages/Plugins/Sitegeist.PaperTiger.CPX',
+                sourcePath: '/dist/Packages/Plugins/Sitegeist.PaperTiger.CPX/Components'
+            },
+            {
+                root: '/dist/LocalPackagesBackup/Sitegeist.PaperTiger.CPX',
+                sourcePath: '/dist/LocalPackagesBackup/Sitegeist.PaperTiger.CPX/Components'
+            }
+        ]],
+        ['Vendor.Site', [{
+            root: '/dist/DistributionPackages/Vendor.Site',
+            sourcePath: '/dist/DistributionPackages/Vendor.Site/Components'
+        }]]
+    ]);
+
+    function packageForFile(fsPath) {
+        let best = null;
+        for (const [name, entries] of packageIndex.entries()) {
+            for (const pkg of entries) {
+                if (fsPath === pkg.sourcePath || fsPath.startsWith(pkg.sourcePath + path.sep)) {
+                    if (!best || pkg.sourcePath.length > best.sourcePath.length) {
+                        best = { name, root: pkg.root, sourcePath: pkg.sourcePath };
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    function buildImportSource(fromFile, targetPath) {
+        const fromPackage = packageForFile(fromFile);
+        const targetPackage = packageForFile(targetPath);
+        if (targetPackage && (!fromPackage || fromPackage.name !== targetPackage.name)) {
+            const subPath = path.relative(targetPackage.sourcePath, targetPath).replace(/\\/g, '/');
+            return `${targetPackage.name}/${subPath}`;
+        }
+        const relativePath = path.relative(path.dirname(fromFile), targetPath).replace(/\\/g, '/');
+        return relativePath.startsWith('.') ? relativePath : `./${relativePath}`;
+    }
+
+    function resolveImportPath(fromFile, importPath) {
+        if (importPath.startsWith('.')) {
+            const resolved = path.normalize(path.resolve(path.dirname(fromFile), importPath));
+            return path.extname(resolved) ? resolved : `${resolved}.cpx`;
+        }
+        const slash = importPath.indexOf('/');
+        if (slash === -1) return null;
+        const entries = packageIndex.get(importPath.slice(0, slash));
+        if (!entries || entries.length === 0) return null;
+        // (server.js additionally prefers a root where the file exists on disk)
+        const resolved = path.normalize(path.join(entries[0].sourcePath, importPath.slice(slash + 1)));
+        return path.extname(resolved) ? resolved : `${resolved}.cpx`;
+    }
+
+    it('derives package key from extra.neos.package-key', () => {
+        assertEqual(derivePackageKey({
+            autoload: { 'psr-4': { 'Sitegeist\\PaperTiger\\CPX\\': 'Classes/' } },
+            extra: { neos: { 'package-key': 'Sitegeist.PaperTiger.CPX' } }
+        }), 'Sitegeist.PaperTiger.CPX');
+    });
+
+    it('derives package key from shortest psr-4 namespace', () => {
+        assertEqual(derivePackageKey({
+            autoload: { 'psr-4': {
+                'Vendor\\Site\\Components\\': 'Components/',
+                'Vendor\\Site\\': 'Classes/'
+            } }
+        }), 'Vendor.Site');
+    });
+
+    it('returns null for manifests without key or psr-4', () => {
+        assertNull(derivePackageKey({ name: 'vendor/whatever' }));
+    });
+
+    it('finds the package owning a file', () => {
+        const pkg = packageForFile('/dist/DistributionPackages/Vendor.Site/Components/Button/Button.cpx');
+        assertEqual(pkg.name, 'Vendor.Site');
+    });
+
+    it('returns null for files outside any package source path', () => {
+        assertNull(packageForFile('/dist/DistributionPackages/Vendor.Site/Classes/Foo.cpx'));
+    });
+
+    it('keeps relative imports within the same package', () => {
+        assertEqual(buildImportSource(
+            '/dist/DistributionPackages/Vendor.Site/Components/LinkedButton/LinkedButton.cpx',
+            '/dist/DistributionPackages/Vendor.Site/Components/Link/Link.cpx'
+        ), '../Link/Link.cpx');
+    });
+
+    it('uses package-style import across package boundaries', () => {
+        assertEqual(buildImportSource(
+            '/dist/DistributionPackages/Vendor.Site/Components/LinkedButton/LinkedButton.cpx',
+            '/dist/LocalPackagesBackup/Sitegeist.PaperTiger.CPX/Components/Label/LabelProps.cpx'
+        ), 'Sitegeist.PaperTiger.CPX/Label/LabelProps.cpx');
+    });
+
+    it('maps files in ANY copy of a duplicated package to the package name', () => {
+        assertEqual(buildImportSource(
+            '/dist/DistributionPackages/Vendor.Site/Components/LinkedButton/LinkedButton.cpx',
+            '/dist/Packages/Plugins/Sitegeist.PaperTiger.CPX/Components/Label/LabelProps.cpx'
+        ), 'Sitegeist.PaperTiger.CPX/Label/LabelProps.cpx');
+    });
+
+    it('uses package-style import when importing file is outside any package', () => {
+        assertEqual(buildImportSource(
+            '/somewhere/else/Thing.cpx',
+            '/dist/LocalPackagesBackup/Sitegeist.PaperTiger.CPX/Components/Label/LabelProps.cpx'
+        ), 'Sitegeist.PaperTiger.CPX/Label/LabelProps.cpx');
+    });
+
+    it('resolves package-style import paths against the package source path', () => {
+        assertEqual(
+            resolveImportPath('/x/y.cpx', 'Sitegeist.PaperTiger.CPX/Error/ErrorProps.cpx'),
+            path.normalize('/dist/Packages/Plugins/Sitegeist.PaperTiger.CPX/Components/Error/ErrorProps.cpx')
+        );
+    });
+
+    it('still resolves relative import paths', () => {
+        assertEqual(
+            resolveImportPath('/a/b/c.cpx', '../Link/Link.cpx'),
+            path.normalize('/a/Link/Link.cpx')
+        );
+    });
+
+    it('returns null for unknown package names', () => {
+        assertNull(resolveImportPath('/x/y.cpx', 'Unknown.Package/Foo.cpx'));
+    });
+
+    // Mirrors the escape check in validateDocument.
+    function relativeImportEscapes(fromFile, resolved) {
+        const fromPackage = packageForFile(fromFile);
+        return Boolean(
+            fromPackage
+            && resolved !== fromPackage.sourcePath
+            && !resolved.startsWith(fromPackage.sourcePath + path.sep)
+        );
+    }
+
+    it('detects a relative import escaping the package source root', () => {
+        const fromFile = '/dist/DistributionPackages/Vendor.Site/Components/LinkedButton/LinkedButton.cpx';
+        const resolved = resolveImportPath(fromFile, '../../../../LocalPackagesBackup/Sitegeist.PaperTiger.CPX/Components/Label/LabelProps.cpx');
+        assert(relativeImportEscapes(fromFile, resolved));
+        // ...and the suggested fix is the package-style import:
+        assertEqual(buildImportSource(fromFile, resolved), 'Sitegeist.PaperTiger.CPX/Label/LabelProps.cpx');
+    });
+
+    it('does not flag relative imports inside the package source root', () => {
+        const fromFile = '/dist/DistributionPackages/Vendor.Site/Components/LinkedButton/LinkedButton.cpx';
+        const resolved = resolveImportPath(fromFile, '../Link/Link.cpx');
+        assert(!relativeImportEscapes(fromFile, resolved));
+    });
+
+    it('does not flag files outside any package', () => {
+        assert(!relativeImportEscapes('/somewhere/Thing.cpx', '/elsewhere/Other.cpx'));
     });
 });
 

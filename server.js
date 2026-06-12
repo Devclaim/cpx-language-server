@@ -30,6 +30,13 @@ const documents = new TextDocuments(TextDocument);
 const workspaceRoots = [];
 const documentIndex = new Map();
 const exportIndex = new Map();
+// Maps a CPX package name (Flow package key, e.g. "Sitegeist.PaperTiger.CPX")
+// to an array of { root, sourcePath }. Mirrors the component-engine convention
+// where every Flow package is a CPX package with sourcePath =
+// <packageRoot>/Components. The same package can exist at several locations
+// (e.g. Packages/Plugins/ and a local backup/development copy), so all roots
+// are kept and files in any copy map back to the same package name.
+const packageIndex = new Map();
 const semanticTokenLegend = {
     tokenTypes: ["class", "enum", "text"],
     tokenModifiers: ["declaration"]
@@ -518,13 +525,96 @@ function ensureCompleteExport(exported, ownerPath) {
     return refreshed.exports.find((entry) => entry.name === exported.name) || exported;
 }
 
+// Derives the Flow package key from a composer manifest the same way the
+// component-engine does: explicit extra.neos["package-key"] first, otherwise
+// the shortest psr-4 namespace ("Vendor\\Package\\" -> "Vendor.Package").
+function derivePackageKey(manifest) {
+    const explicit = manifest && manifest.extra && manifest.extra.neos && manifest.extra.neos["package-key"];
+    if (typeof explicit === "string" && explicit.length > 0) {
+        return explicit;
+    }
+
+    const psr4 = manifest && manifest.autoload && manifest.autoload["psr-4"];
+    if (psr4) {
+        const namespaces = Object.keys(psr4).sort((a, b) => a.length - b.length);
+        if (namespaces.length > 0) {
+            return namespaces[0].replace(/\\+$/, "").replace(/\\/g, ".");
+        }
+    }
+
+    return null;
+}
+
+function registerPackageRoot(dir) {
+    try {
+        const manifest = JSON.parse(fs.readFileSync(path.join(dir, "composer.json"), "utf8"));
+        const packageName = derivePackageKey(manifest);
+        if (!packageName) {
+            return;
+        }
+
+        const root = normalizePath(dir);
+        const sourcePath = normalizePath(path.join(dir, "Components"));
+        const entries = packageIndex.get(packageName) || [];
+        if (entries.some((entry) => entry.root === root)) {
+            return;
+        }
+        entries.push({ root, sourcePath });
+        // Keep the shallowest root first so name → path resolution prefers it.
+        entries.sort((a, b) => a.root.length - b.root.length);
+        packageIndex.set(packageName, entries);
+    } catch {
+        // Unreadable or invalid composer.json — not a package root.
+    }
+}
+
+// Returns { name, root, sourcePath } of the package whose sourcePath contains
+// the file, preferring the most specific (longest) match for nested packages.
+function packageForFile(fsPath) {
+    let best = null;
+    for (const [name, entries] of packageIndex.entries()) {
+        for (const pkg of entries) {
+            if (fsPath === pkg.sourcePath || fsPath.startsWith(pkg.sourcePath + path.sep)) {
+                if (!best || pkg.sourcePath.length > best.sourcePath.length) {
+                    best = { name, root: pkg.root, sourcePath: pkg.sourcePath };
+                }
+            }
+        }
+    }
+    return best;
+}
+
 function resolveImportPath(fromFile, importPath) {
-    if (!importPath.startsWith(".")) {
+    if (importPath.startsWith(".")) {
+        const resolved = normalizePath(path.resolve(path.dirname(fromFile), importPath));
+        return path.extname(resolved) ? resolved : `${resolved}.cpx`;
+    }
+
+    // Package-style import: "Vendor.Package/Sub/Path.cpx" resolves against the
+    // package's source path, matching the component-engine build.
+    const slash = importPath.indexOf("/");
+    if (slash === -1) {
         return null;
     }
 
-    const resolved = normalizePath(path.resolve(path.dirname(fromFile), importPath));
-    return path.extname(resolved) ? resolved : `${resolved}.cpx`;
+    const entries = packageIndex.get(importPath.slice(0, slash));
+    if (!entries || entries.length === 0) {
+        return null;
+    }
+
+    const subPath = importPath.slice(slash + 1);
+    let fallback = null;
+    for (const pkg of entries) {
+        let resolved = normalizePath(path.join(pkg.sourcePath, subPath));
+        resolved = path.extname(resolved) ? resolved : `${resolved}.cpx`;
+        if (fs.existsSync(resolved)) {
+            return resolved;
+        }
+        if (!fallback) {
+            fallback = resolved;
+        }
+    }
+    return fallback;
 }
 
 function isInsideRange(position, range) {
@@ -657,6 +747,10 @@ function buildComponentSnippet(candidate, closingTagContext) {
 async function scanDirectory(root) {
     const entries = await fs.promises.readdir(root, { withFileTypes: true });
 
+    if (entries.some((entry) => entry.isFile() && entry.name === "composer.json")) {
+        registerPackageRoot(root);
+    }
+
     for (const entry of entries) {
         if (entry.name === "node_modules" || entry.name.startsWith(".")) {
             continue;
@@ -681,6 +775,7 @@ async function scanDirectory(root) {
 async function rebuildIndex() {
     documentIndex.clear();
     exportIndex.clear();
+    packageIndex.clear();
 
     for (const root of workspaceRoots) {
         try {
@@ -1033,31 +1128,73 @@ function resolveSymbolExport(parsed, symbolName) {
     return null;
 }
 
+// Builds the import source for importing targetPath from within fromFile.
+// Stays relative inside the same package; crosses package boundaries with a
+// package-style path ("Vendor.Package/Sub/Path.cpx"), since relative imports
+// must not escape the package source root in the component-engine build.
+function buildImportSource(fromFile, targetPath) {
+    const fromPackage = packageForFile(fromFile);
+    const targetPackage = packageForFile(targetPath);
+
+    if (targetPackage && (!fromPackage || fromPackage.name !== targetPackage.name)) {
+        const subPath = path.relative(targetPackage.sourcePath, targetPath).replace(/\\/g, "/");
+        return `${targetPackage.name}/${subPath}`;
+    }
+
+    const relativePath = path.relative(path.dirname(fromFile), targetPath).replace(/\\/g, "/");
+    return relativePath.startsWith(".") ? relativePath : `./${relativePath}`;
+}
+
 function uniqueAutoImportCandidates(parsed, preferredKind) {
     const importedNames = new Set(parsed.imports.flatMap((entry) => entry.names.map((item) => item.name)));
     const localExports = new Set(parsed.exports.map((entry) => entry.name));
+    const fromPackage = packageForFile(parsed.path);
     const seen = new Set();
     const items = [];
 
     for (const [name, definitions] of exportIndex.entries()) {
-        if (importedNames.has(name) || localExports.has(name) || seen.has(name)) {
+        if (importedNames.has(name) || localExports.has(name)) {
             continue;
         }
 
-        const preferred = definitions.find((definition) => definition.kind === preferredKind) || definitions[0];
-        const relativePath = path.relative(path.dirname(parsed.path), preferred.path).replace(/\\/g, "/");
-        const source = relativePath.startsWith(".") ? relativePath : `./${relativePath}`;
+        const ordered = preferredKind
+            ? [...definitions].sort((a, b) => Number(b.kind === preferredKind) - Number(a.kind === preferredKind))
+            : definitions;
 
-        seen.add(name);
-        items.push({
-            name,
-            kind: preferred.kind,
-            props: preferred.props,
-            source
-        });
+        // One candidate per distinct import source, so the same component name
+        // in several packages yields several suggestions instead of an
+        // arbitrary winner. Duplicate copies of the same package (vendor/,
+        // backups) collapse naturally: they produce the same package-style
+        // source string.
+        for (const definition of ordered) {
+            const targetPackage = packageForFile(definition.path);
+
+            // When the importing file lives in a package, skip exports that
+            // live in no package source root — the component build could not
+            // import them (vendor copies, test fixtures, etc.).
+            if (fromPackage && !targetPackage) {
+                continue;
+            }
+
+            const source = buildImportSource(parsed.path, definition.path);
+            const key = `${name} ${source}`;
+            if (seen.has(key)) {
+                continue;
+            }
+
+            seen.add(key);
+            items.push({
+                name,
+                kind: definition.kind,
+                props: definition.props,
+                source,
+                // Same-package (relative) suggestions rank above cross-package ones.
+                samePackage: Boolean(fromPackage && targetPackage && fromPackage.name === targetPackage.name)
+            });
+        }
     }
 
-    return items.sort((a, b) => a.name.localeCompare(b.name));
+    return items.sort((a, b) => a.name.localeCompare(b.name) || Number(b.samePackage) - Number(a.samePackage));
 }
 
 function localComponentCandidates(parsed) {
@@ -1264,7 +1401,21 @@ function validateDocument(parsed) {
     for (const importEntry of parsed.imports) {
         const resolved = resolveImportPath(parsed.path, importEntry.source);
         if (resolved === null) {
-            continue; // non-relative import, skip
+            // Package-style import with an unknown package key. Only warn when
+            // package discovery actually found packages, to avoid noise in
+            // workspaces without composer manifests.
+            if (!importEntry.source.startsWith(".") && packageIndex.size > 0) {
+                const slash = importEntry.source.indexOf("/");
+                const packageName = slash === -1 ? importEntry.source : importEntry.source.slice(0, slash);
+                diagnostics.push(Diagnostic.create(
+                    importEntry.sourceRange,
+                    `Unknown package "${packageName}" — no package with this key was found in the workspace`,
+                    DiagnosticSeverity.Warning,
+                    "unknown-package",
+                    "cpx"
+                ));
+            }
+            continue;
         }
 
         if (!fs.existsSync(resolved)) {
@@ -1276,6 +1427,32 @@ function validateDocument(parsed) {
                 "cpx"
             ));
             continue;
+        }
+
+        // Relative imports must stay inside the package source root — the
+        // component-engine build cannot resolve paths that escape it.
+        if (importEntry.source.startsWith(".")) {
+            const fromPackage = packageForFile(parsed.path);
+            const escapes = fromPackage
+                && resolved !== fromPackage.sourcePath
+                && !resolved.startsWith(fromPackage.sourcePath + path.sep);
+            if (escapes) {
+                const targetPackage = packageForFile(resolved);
+                const fix = targetPackage ? buildImportSource(parsed.path, resolved) : null;
+                const diag = Diagnostic.create(
+                    importEntry.sourceRange,
+                    fix
+                        ? `Relative import escapes package "${fromPackage.name}" and won't resolve in the component build — use "${fix}" instead`
+                        : `Relative import escapes package "${fromPackage.name}" and won't resolve in the component build`,
+                    DiagnosticSeverity.Error,
+                    "cross-package-import",
+                    "cpx"
+                );
+                if (fix) {
+                    diag.data = { fix };
+                }
+                diagnostics.push(diag);
+            }
         }
 
         let target = documentIndex.get(normalizePath(resolved));
@@ -1298,16 +1475,27 @@ function validateDocument(parsed) {
         }
     }
 
+    // Strict check for validation: the symbol must be explicitly imported or
+    // declared in this file. Unlike resolveImportedSymbol, this never falls
+    // back to the global export index — a component that merely exists
+    // somewhere in the workspace still won't render in the component build
+    // without an import.
+    const isImportedOrDeclared = (symbolName) =>
+        parsed.imports.some((entry) => entry.names.some((item) => item.name === symbolName))
+        || parsed.exports.some((entry) => entry.name === symbolName);
+
     // 2. Component tag usages — must be imported or locally declared
     for (const usage of parsed.usages) {
-        if (!resolveImportedSymbol(parsed, usage.name)) {
-            diagnostics.push(Diagnostic.create(
+        if (!isImportedOrDeclared(usage.name)) {
+            const diag = Diagnostic.create(
                 usage.range,
-                `"${usage.name}" is not imported or declared`,
-                DiagnosticSeverity.Warning,
-                undefined,
+                `"${usage.name}" is not imported or declared — it won't render in the component build`,
+                DiagnosticSeverity.Error,
+                "missing-import",
                 "cpx"
-            ));
+            );
+            diag.data = { name: usage.name };
+            diagnostics.push(diag);
         }
     }
 
@@ -1316,14 +1504,16 @@ function validateDocument(parsed) {
         if (PRIMITIVE_TYPES.has(usage.name.toLowerCase())) {
             continue;
         }
-        if (!resolveImportedSymbol(parsed, usage.name)) {
-            diagnostics.push(Diagnostic.create(
+        if (!isImportedOrDeclared(usage.name)) {
+            const diag = Diagnostic.create(
                 usage.range,
                 `Type "${usage.name}" is not imported or declared`,
-                DiagnosticSeverity.Warning,
-                undefined,
+                DiagnosticSeverity.Error,
+                "missing-import",
                 "cpx"
-            ));
+            );
+            diag.data = { name: usage.name };
+            diagnostics.push(diag);
         }
     }
 
@@ -1445,8 +1635,9 @@ function validateDocument(parsed) {
     const LITERAL_COMPATIBLE = {
         string:  ['string', 'slot'],  // slot accepts string literals as text content
         boolean: ['boolean'],
-        number:  ['number', 'integer'],
-        null:    []  // null literal is never a valid prop value in CPX
+        number:  ['number', 'integer']
+        // null is handled separately: valid for optional ("?") types and
+        // types that explicitly include null.
     };
     for (const usage of parsed.attrValueLiteralUsages) {
         const tagExport = resolveImportedSymbol(parsed, usage.tagName);
@@ -1455,12 +1646,17 @@ function validateDocument(parsed) {
         const prop = tagExport.props.find((p) => p.name === usage.attrName);
         if (!prop) continue;
 
-        const typeComponents = prop.type
-            .split('|')
-            .map((t) => t.trim().replace(/^\?/, '').replace(/\[\]$/, '').toLowerCase());
+        const rawComponents = prop.type.split('|').map((t) => t.trim());
+        const typeComponents = rawComponents
+            .map((t) => t.replace(/^\?/, '').replace(/\[\]$/, '').toLowerCase());
 
-        const compatible = LITERAL_COMPATIBLE[usage.literalType] || [];
-        const isCompatible = typeComponents.some((t) => compatible.includes(t));
+        let isCompatible;
+        if (usage.literalType === 'null') {
+            isCompatible = rawComponents.some((t) => t.startsWith('?')) || typeComponents.includes('null');
+        } else {
+            const compatible = LITERAL_COMPATIBLE[usage.literalType] || [];
+            isCompatible = typeComponents.some((t) => compatible.includes(t));
+        }
 
         if (!isCompatible) {
             diagnostics.push(Diagnostic.create(
@@ -1527,6 +1723,9 @@ connection.onInitialize(async (params) => {
             },
             completionProvider: {
                 triggerCharacters: ["<", "{", "\"", "/", ".", " "]
+            },
+            codeActionProvider: {
+                codeActionKinds: ["quickfix"]
             }
         }
     };
@@ -1569,6 +1768,63 @@ documents.onDidClose((event) => {
 
 connection.onDidChangeWatchedFiles(async () => {
     await rebuildIndex();
+});
+
+connection.onCodeAction((params) => {
+    const actions = [];
+
+    for (const diagnostic of (params.context && params.context.diagnostics) || []) {
+        if (diagnostic.code === "missing-import" && diagnostic.data && diagnostic.data.name) {
+            const parsed = getDocumentData(params.textDocument.uri);
+            if (parsed) {
+                const fromPackage = packageForFile(parsed.path);
+                const insertAt = importInsertPosition(parsed);
+                const seen = new Set();
+                for (const definition of exportIndex.get(diagnostic.data.name) || []) {
+                    const targetPackage = packageForFile(definition.path);
+                    if (fromPackage && !targetPackage) {
+                        continue;
+                    }
+                    const source = buildImportSource(parsed.path, definition.path);
+                    if (seen.has(source)) {
+                        continue;
+                    }
+                    seen.add(source);
+                    actions.push({
+                        title: `Import ${diagnostic.data.name} from "${source}"`,
+                        kind: "quickfix",
+                        diagnostics: [diagnostic],
+                        edit: {
+                            changes: {
+                                [params.textDocument.uri]: [{
+                                    range: Range.create(insertAt, insertAt),
+                                    newText: `from "${source}" import { ${diagnostic.data.name} }\n`
+                                }]
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
+        if (diagnostic.code === "cross-package-import" && diagnostic.data && diagnostic.data.fix) {
+            actions.push({
+                title: `Convert to package import "${diagnostic.data.fix}"`,
+                kind: "quickfix",
+                diagnostics: [diagnostic],
+                edit: {
+                    changes: {
+                        [params.textDocument.uri]: [{
+                            range: diagnostic.range,
+                            newText: diagnostic.data.fix
+                        }]
+                    }
+                }
+            });
+        }
+    }
+
+    return actions;
 });
 
 connection.onDefinition((params) => {
@@ -1889,8 +2145,7 @@ connection.onCompletion((params) => {
                         const isImported = parsed.imports.some((e) => e.names.some((n) => n.name === typeName));
                         const enumFilePath = typeExport.path;
                         const autoImportEdits = (!isImported && enumFilePath) ? (() => {
-                            const rel = path.relative(path.dirname(parsed.path), enumFilePath).replace(/\\/g, '/');
-                            const src = rel.startsWith('.') ? rel : `./${rel}`;
+                            const src = buildImportSource(parsed.path, enumFilePath);
                             return [{
                                 range: Range.create(importInsertPosition(parsed), importInsertPosition(parsed)),
                                 newText: `from "${src}" import { ${typeName} }\n`
@@ -2032,7 +2287,9 @@ connection.onCompletion((params) => {
                 insertText: tagContext ? buildComponentSnippet(candidate, closingTagContext) : candidate.name,
                 insertTextFormat: tagContext ? InsertTextFormat.Snippet : InsertTextFormat.PlainText,
                 insertTextMode: InsertTextMode.adjustIndentation,
-                additionalTextEdits: autoImportEdit
+                additionalTextEdits: autoImportEdit,
+                // Same-package suggestions before cross-package ones with the same name.
+                sortText: `${candidate.samePackage ? "1" : "2"}_${candidate.name}`
             });
             // Only components can be used as collections (Type[])
             if (typeContext && !tagContext && candidate.kind === "component") {

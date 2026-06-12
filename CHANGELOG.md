@@ -2,6 +2,25 @@
 
 All notable changes to the "cpx" extension will be documented in this file.
 
+## [0.4.0] - 2026-06-12
+
+### Package-Aware Imports
+
+- **Package discovery** — Neos/Flow packages are now detected by convention from their `composer.json` (package key from `extra.neos.package-key`, falling back to the psr-4 namespace), with `Components/` as the CPX source root — matching the component-engine build's `CPXPackageLoader`. Packages existing at multiple locations (e.g. `Packages/Plugins/` and a local development copy) are all tracked under the same package key
+- **Package-style import resolution** — imports like `from "Sitegeist.PaperTiger.CPX/Error/ErrorProps.cpx" import { ErrorProps }` now resolve for go-to-definition, hover, and validation; when a package exists in several copies, the copy where the file actually exists is preferred
+- **Cross-package auto-imports** — auto-import now generates package-style paths (`Vendor.Package/Sub/Path.cpx`) when the target lives in a different package, and relative paths only within the same package — no more `../../../../../Packages/…` imports that the build can't resolve
+- **One suggestion per package** — components sharing a name across packages each get their own auto-import suggestion (instead of an arbitrary single winner); same-package suggestions rank first, and exports outside any package source root (vendor copies, test fixtures) are excluded
+
+### Error Checking
+
+- **Escaping relative imports** — a relative import that resolves outside its package's `Components/` root is flagged as an error, with a quick fix that converts it to the equivalent package-style import
+- **Unknown package keys** — package-style imports referencing a package key not found in the workspace are flagged with a warning
+- **Missing imports are errors** — using a component tag or prop type that is not imported or locally declared is now an error (previously a warning that was suppressed whenever a same-named export existed anywhere in the workspace); a quick fix offers `Import X from "…"` for every valid source
+
+### Bug Fixes
+
+- **Null literals on optional props** — `width={null}` on a `?number` prop no longer reports "expects ?number, not a null literal"; null is accepted for optional (`?`) prop types and types that explicitly include `null`
+
 ## [0.3.0] - 2026-06-05
 
 ### Completions
