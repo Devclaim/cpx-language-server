@@ -1,13 +1,13 @@
 {
-    "name": "component-engine-language-support",
-    "displayName": "Component Engine (CPX) Language Support",
-    "description": "Placeholder language support for Component Engine (CPX)",
+    "name": "cpx-language-server",
+    "displayName": "CPX Language Server",
+    "description": "Language server for the CPX component template language (Component Engine)",
     "version": "0.4.0",
     "publisher": "Devclaim",
     "license": "MIT",
     "repository": {
         "type": "git",
-        "url": "https://codeberg.org/Devclaim/cpx-grammar.git"
+        "url": "https://github.com/Devclaim/cpx-language-server"
     },
     "main": "./extension.js",
     "engines": {
