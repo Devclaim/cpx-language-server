@@ -590,8 +590,8 @@ describe('findUnusedImports', () => {
         assertEqual(findUnusedImports(t).length, 0);
     });
 
-    it('import used as array prop type → not unused', () => {
-        const t = `from "./Item" import { Item }\nexport component X {\n  items: Item[]\n  render <div />\n}`;
+    it('import used as generic list prop type → not unused', () => {
+        const t = `from "./Item" import { Item }\nexport component X {\n  items: list<Item>\n  render <div />\n}`;
         assertEqual(findUnusedImports(t).length, 0);
     });
 

@@ -611,9 +611,9 @@
       "end": "$",
       "patterns": [
         {
-          "comment": "Built-in types, including the list<…> generic collection keyword",
+          "comment": "Built-in types",
           "name": "support.type.primitive.cpx",
-          "match": "\\b(boolean|string|number|slot|list)\\b"
+          "match": "\\b(boolean|string|number|slot)(?:\\[\\])?"
         },
         {
           "comment": "Optional type prefix",
@@ -621,23 +621,13 @@
           "match": "\\?"
         },
         {
-          "comment": "Generic type argument brackets, e.g. list<Foo>",
-          "name": "punctuation.definition.typeparameters.cpx",
-          "match": "[<>]"
-        },
-        {
-          "comment": "PascalCase type name",
+          "comment": "PascalCase type with optional [] suffix",
           "name": "entity.name.type.class.js",
-          "match": "[A-Z][A-Za-z0-9_]*"
+          "match": "[A-Z][A-Za-z0-9_]*(?:\\[\\])?"
         },
         {
           "name": "keyword.operator.type.cpx",
           "match": "\\|"
-        },
-        {
-          "comment": "Separator between multiple generic type arguments",
-          "name": "punctuation.separator.comma.cpx",
-          "match": ","
         }
       ]
     },

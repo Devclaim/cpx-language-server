@@ -2,6 +2,21 @@
 
 All notable changes to the "cpx" extension will be documented in this file.
 
+## [0.4.1] - 2026-06-19
+
+### HTML Tag Completions & Auto-close
+
+- **HTML tag completions** — typing `<` now suggests all standard HTML tags alongside CPX components; void elements (`br`, `img`, `input`, `hr`, …) complete as self-closing `<br />`, regular elements complete as paired `<div>cursor</div>`
+- **Auto-close on typing `>`** — when an opening tag is completed with `>`, the matching closing tag is inserted automatically via LSP `onTypeFormatting`; self-closing and void elements are excluded; works in VS Code and PhpStorm (LSP4IJ) without any extra extensions or settings
+- **`editor.formatOnType` enabled by default** — the extension now sets this for `.cpx` files so auto-close works out of the box in VS Code
+- **Generic list type syntax** — the parser now follows component-engine 1.0.0-alpha4/5: the old `Type[]` collection shorthand is gone, replaced by generic `list<Type>` syntax (including unions, nesting, multiple type arguments, trailing commas, and whitespace/comments inside `<…>`); `Type[]` is now correctly flagged as a syntax error
+- **`list<Type>`-typed props are no longer invisible** — the property indexer used by hover, attribute completion, and match-arm autofill didn't recognize the new generic syntax at all, so any prop declared as `items: list<Foo>` silently vanished from the server's model of the component; fixed, and the obsolete "only components support `[]`" diagnostic (which the same migration made both redundant and wrong) was removed
+- **Auto-import for collection props** now inserts `list<Type>` instead of the no-longer-valid `Type[]`, and is offered for any importable kind (component/struct/enum), not just components
+- Added `server.integration.test.js` — drives the real `server.js` completion handler in-process (mocking the LSP transport) rather than re-testing standalone copies of its logic, to catch regressions that a real request would hit but an isolated helper wouldn't
+- **`editor.quickSuggestions` enabled by default for `.cpx` files** — completions that trigger on typed text rather than a punctuation character (e.g. typing `match` to get the match-block snippet) depend on VS Code's automatic "suggest while typing"; without an explicit default it could stay off depending on the user's global/workspace settings, silently hiding these suggestions while trigger-character-based ones (`<`, `{`, …) kept working normally
+- **Fixed: typing/completing inside `list<…>` was mistaken for opening a tag** — the real cause of the bogus `</AccordionItem>` insertion (the previous fix only patched one of several affected spots): `isTagContext`, `getOpenTagContext`, `getOpenHtmlTagContext`, `isClosingTagContext`, `getExistingCloseTagInfo`, and the `>`-auto-close logic all located "the tag" by finding the nearest `<` before the cursor, with no check that it actually opened a tag rather than a generic's argument list (`list<Foo`). All six now share one guard: a `<` directly preceded by an identifier character can never be a real CPX tag's `<`, so it's treated as a generic instead. `isTypeContext` was also extended to recognize being inside the single argument of a `list<…>`, so completions (including auto-import) work correctly while typing it, and the `list<Type>` auto-import suggestion no longer offers a nonsensical `list<list<Foo>>` double-wrap when already inside one
+- **`list` now gets keyword coloring** in the TextMate grammar, alongside `boolean`/`string`/`number`/`slot`; the generic's `<…>` brackets and, for multiple type arguments, its commas are now styled as punctuation too — previously `list` in `list<Foo>` rendered as plain unstyled text
+
 ## [0.4.0] - 2026-06-12
 
 ### Package-Aware Imports

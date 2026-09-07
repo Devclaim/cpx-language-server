@@ -2,7 +2,7 @@
     "name": "cpx-language-server",
     "displayName": "CPX Language Server",
     "description": "Language server for the CPX component template language (Component Engine)",
-    "version": "0.4.0",
+    "version": "0.4.1",
     "publisher": "Devclaim",
     "license": "MIT",
     "repository": {
@@ -23,7 +23,7 @@
         "Programming Languages"
     ],
     "scripts": {
-        "check": "node --check extension.js && node --check server.js && node cpxParser.test.js && node server.test.js"
+        "check": "node --check extension.js && node --check server.js && node cpxParser.test.js && node server.test.js && node server.integration.test.js"
     },
     "dependencies": {
         "vscode-html-languageservice": "^5.6.2",
@@ -40,7 +40,14 @@
                 "editor.suggest.showWords": false,
                 "editor.suggest.showKeywords": false,
                 "editor.suggest.showSnippets": false,
-                "editor.snippetSuggestions": "none"
+                "editor.snippetSuggestions": "none",
+                "editor.formatOnType": true,
+                "editor.linkedEditing": true,
+                "editor.quickSuggestions": {
+                    "other": true,
+                    "comments": false,
+                    "strings": false
+                }
             },
             "tailwindCSS.includeLanguages": {
                 "cpx": "html"

@@ -515,22 +515,21 @@ class CPXParser {
 
     // ── Type Reference ────────────────────────────────────────────────────────
 
+    /**
+     * TypeReference = Identifier ('|' Identifier)* ('<' TypeReference (',' TypeReference?)* '>')?
+     *               | '?' Identifier
+     *
+     * The generic argument list (e.g. `list<Card>`) replaced the old `Type[]`
+     * collection-array shorthand as of component-engine 1.0.0-alpha4 — `[]` is
+     * no longer valid grammar. No space is allowed between the type name and
+     * the opening `<`, but whitespace/comments are tolerated inside it.
+     */
     parseTypeReference() {
-        const PRIMITIVES = new Set(['boolean', 'string', 'number', 'slot']);
         if (this.tryLiteral('?')) {
             this.requireIdentifier();
             return;
         }
-        const typeName = this.requireIdentifier();
-        if (this.tryLiteral('[]')) {
-            if (PRIMITIVES.has(typeName)) {
-                throw new ParseError(
-                    `"${typeName}" cannot be used as a collection type — only components support []`,
-                    this.line, this.col - 2, this.line, this.col
-                );
-            }
-            return;
-        }
+        this.requireIdentifier();
         // Union type: Identifier (| Identifier)*  – spaces around | are tolerated
         while (true) {
             const s = this.save();
@@ -538,6 +537,21 @@ class CPXParser {
             if (!this.tryLiteral('|')) { this.restore(s); break; }
             this.osp();
             if (!this.tryIdentifier()) { this.restore(s); break; }
+        }
+        // Generic argument list: <TypeReference (, TypeReference)* ,?>
+        if (this.peek() === '<') {
+            this.advance();
+            this.osp();
+            this.parseTypeReference();
+            this.osp();
+            while (this.peek() === ',') {
+                this.advance();
+                this.osp();
+                if (this.peek() === '>') break; // trailing comma
+                this.parseTypeReference();
+                this.osp();
+            }
+            this.requireLiteral('>');
         }
     }
 

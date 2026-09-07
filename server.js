@@ -182,9 +182,17 @@ function findBlockEnd(text, blockStart) {
     return text.length;
 }
 
+// A single type atom: an optional `?`, then either a `list<…>` generic
+// (component-engine 1.0.0-alpha4+ — replaced the old `Type[]` suffix) or a
+// bare primitive/identifier name.
+const TYPE_ATOM_SOURCE = '\\??(?:list<\\s*\\??(?:slot|boolean|string|number|[A-Z][A-Za-z0-9_]*)\\s*>|(?:slot|boolean|string|number|[A-Z][A-Za-z0-9_]*))';
+
 function parsePropertyDeclarations(blockText, baseOffset = 0, fullText = blockText) {
     const props = [];
-    const propertyRegex = /^\s*([a-z][A-Za-z0-9_]*)\s*:\s*(\??(?:slot|boolean|string|number|[A-Z][A-Za-z0-9_]*)(?:\[\])?(?:\s*\|\s*\??(?:slot|boolean|string|number|[A-Z][A-Za-z0-9_]*)(?:\[\])?)*)\s*$/gm;
+    const propertyRegex = new RegExp(
+        `^\\s*([a-z][A-Za-z0-9_]*)\\s*:\\s*(${TYPE_ATOM_SOURCE}(?:\\s*\\|\\s*${TYPE_ATOM_SOURCE})*)\\s*$`,
+        'gm'
+    );
     let match;
 
     while ((match = propertyRegex.exec(blockText))) {
@@ -669,21 +677,112 @@ function isTypeContext(text, position) {
     const offset = offsetAt(text, position);
     const lineStart = text.lastIndexOf("\n", offset - 1) + 1;
     const prefix = text.slice(lineStart, offset);
-    return /:\s*(?:\??[A-Z]?[A-Za-z0-9_]*\s*\|\s*)*\??[A-Z]?[A-Za-z0-9_]*$/.test(prefix);
+    // A trailing `(?:<\s*ATOM)?` also matches the single type argument of a
+    // `list<…>` generic, so completions still work while typing its item type.
+    return /:\s*(?:\??[A-Z]?[A-Za-z0-9_]*\s*\|\s*)*\??[A-Z]?[A-Za-z0-9_]*(?:<\s*\??[A-Z]?[A-Za-z0-9_]*)?$/.test(prefix);
+}
+
+// True once the cursor is past an unclosed `<` following the last `:` on the
+// line — i.e. already inside a `list<…>` generic's argument, as opposed to
+// being positioned to start a new type reference.
+function isInsideGenericTypeArgument(text, position) {
+    const offset = offsetAt(text, position);
+    const lineStart = text.lastIndexOf("\n", offset - 1) + 1;
+    const prefix = text.slice(lineStart, offset);
+    const colonIdx = prefix.lastIndexOf(":");
+    if (colonIdx === -1) return false;
+    return prefix.slice(colonIdx).includes("<");
+}
+
+// A `<` immediately preceded by an identifier character (e.g. `list<Foo`)
+// opens a generic type argument list, not a tag — a real CPX tag's `<` can
+// never follow an identifier with no separator. Every tag-context detector
+// below excludes that case so `list<…>` is never mistaken for `<…>`.
+const NOT_AFTER_IDENTIFIER = "(?<![A-Za-z0-9_])";
+
+function isGenericBracket(text, ltIndex) {
+    return ltIndex > 0 && /[A-Za-z0-9_]/.test(text[ltIndex - 1]);
 }
 
 function isTagContext(text, position) {
     const offset = offsetAt(text, position);
     const lineStart = text.lastIndexOf("\n", offset - 1) + 1;
     const prefix = text.slice(lineStart, offset);
-    return /<[/]?[A-Z][A-Za-z0-9_]*$/.test(prefix) || /<$/.test(prefix);
+    return new RegExp(`${NOT_AFTER_IDENTIFIER}<[/]?[A-Z][A-Za-z0-9_]*$`).test(prefix)
+        || new RegExp(`${NOT_AFTER_IDENTIFIER}<$`).test(prefix);
+}
+
+function isHtmlTagNameContext(text, position) {
+    const offset = offsetAt(text, position);
+    const lineStart = text.lastIndexOf("\n", offset - 1) + 1;
+    const prefix = text.slice(lineStart, offset);
+    // Cursor is after a partial lowercase tag name, e.g. <div, <sp, <a
+    return new RegExp(`${NOT_AFTER_IDENTIFIER}<[a-z][a-zA-Z0-9-]*$`).test(prefix);
+}
+
+const VOID_ELEMENTS = new Set([
+    'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+    'link', 'meta', 'param', 'source', 'track', 'wbr'
+]);
+
+const HTML_REGULAR_TAGS = [
+    'a', 'abbr', 'address', 'article', 'aside', 'audio',
+    'b', 'bdi', 'bdo', 'blockquote', 'button',
+    'canvas', 'caption', 'cite', 'code', 'colgroup',
+    'data', 'datalist', 'dd', 'del', 'details', 'dfn', 'dialog', 'div', 'dl', 'dt',
+    'em', 'fieldset', 'figcaption', 'figure', 'footer', 'form',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'i', 'iframe', 'ins',
+    'kbd', 'label', 'legend', 'li', 'main', 'map', 'mark', 'menu', 'meter',
+    'nav', 'noscript', 'object', 'ol', 'optgroup', 'option', 'output',
+    'p', 'picture', 'pre', 'progress', 'q', 'rp', 'rt', 'ruby',
+    's', 'samp', 'section', 'select', 'small', 'span', 'strong',
+    'sub', 'summary', 'sup', 'table', 'tbody', 'td', 'template', 'textarea',
+    'tfoot', 'th', 'thead', 'time', 'tr', 'u', 'ul', 'var', 'video'
+];
+
+// Returns the tag name to auto-close when the user types '>',
+// or null if auto-closing is not appropriate.
+function getAutoCloseTagName(text, position) {
+    const offset = offsetAt(text, position);
+    const before = text.slice(0, offset);
+
+    // The '>' should be the last character (it was just typed)
+    if (!before.endsWith('>')) return null;
+
+    // Don't auto-close self-closing tags: />
+    if (/\/\s*>$/.test(before)) return null;
+
+    // Find the opening <
+    const openIdx = before.lastIndexOf('<');
+    if (openIdx === -1) return null;
+    if (isGenericBracket(before, openIdx)) return null;
+
+    const tagSlice = before.slice(openIdx);
+
+    // Must be an opening tag, not a closing </tag>
+    if (tagSlice.startsWith('</')) return null;
+
+    // Fragment <> — auto-close with </>
+    if (tagSlice === '<>') return '';
+
+    // Extract tag name — must follow immediately after <
+    const match = tagSlice.match(/^<([A-Za-z][A-Za-z0-9_:-]*)(?:\s|>)/);
+    if (!match) return null;
+
+    const tagName = match[1];
+
+    // Don't auto-close HTML void elements
+    if (VOID_ELEMENTS.has(tagName.toLowerCase())) return null;
+
+    return tagName;
 }
 
 function isClosingTagContext(text, position) {
     const offset = offsetAt(text, position);
     const lineStart = text.lastIndexOf("\n", offset - 1) + 1;
     const prefix = text.slice(lineStart, offset);
-    return /<\/[A-Z][A-Za-z0-9_]*$/.test(prefix) || /<\/$/.test(prefix);
+    return new RegExp(`${NOT_AFTER_IDENTIFIER}<\\/[A-Z][A-Za-z0-9_]*$`).test(prefix)
+        || new RegExp(`${NOT_AFTER_IDENTIFIER}<\\/$`).test(prefix);
 }
 
 function getOpenTagContext(text, position) {
@@ -691,6 +790,9 @@ function getOpenTagContext(text, position) {
     const left = text.slice(0, offset);
     const tagStart = left.lastIndexOf("<");
     if (tagStart === -1) {
+        return null;
+    }
+    if (isGenericBracket(left, tagStart)) {
         return null;
     }
 
@@ -718,6 +820,7 @@ function getOpenHtmlTagContext(text, position) {
     const left = text.slice(0, offset);
     const tagStart = left.lastIndexOf("<");
     if (tagStart === -1) return null;
+    if (isGenericBracket(left, tagStart)) return null;
     const tail = left.slice(tagStart);
     if (tail.startsWith("</") || tail.includes(">")) return null;
     const match = tail.match(/^<([a-z][a-zA-Z0-9-]*)(?:\s+[^<>]*)?$/);
@@ -726,6 +829,33 @@ function getOpenHtmlTagContext(text, position) {
     return {
         tagName: match[1],
         partialAttribute: attrMatch && attrMatch[1] ? attrMatch[1] : ""
+    };
+}
+
+// When the cursor is inside an opening tag like <MyC| and there is already a matching
+// close tag directly after (e.g. </MyC>), returns the absolute positions needed to
+// build a textEdit that replaces the word + ></oldTag> in one operation so the
+// accepted completion does not produce a duplicate closing tag.
+// Returns { wordStart, existingCloseTagEnd } or null.
+function getExistingCloseTagInfo(text, position) {
+    const offset = offsetAt(text, position);
+    const before = text.slice(0, offset);
+    const openIdx = before.lastIndexOf('<');
+    if (openIdx === -1) return null;
+    if (isGenericBracket(before, openIdx)) return null;
+    const tagSlice = before.slice(openIdx);
+    // must be an opening tag, not yet closed
+    if (tagSlice.startsWith('</') || tagSlice.includes('>')) return null;
+    const nameMatch = tagSlice.match(/^<([A-Za-z][A-Za-z0-9_:-]*)/);
+    if (!nameMatch) return null;
+    const partialName = nameMatch[1];
+    const after = text.slice(offset);
+    // Match: > (optional whitespace) </partialName (exact) optional-whitespace >
+    const closeTagMatch = after.match(new RegExp(`^>\\s*<\\/${partialName}\\s*>`));
+    if (!closeTagMatch) return null;
+    return {
+        wordStart: openIdx + 1, // absolute position of first char of tag name
+        existingCloseTagEnd: offset + closeTagMatch[0].length // absolute position after </oldName>
     };
 }
 
@@ -1517,25 +1647,10 @@ function validateDocument(parsed) {
         }
     }
 
-    // 4. Collection types must be components
-    for (const usage of parsed.typeUsages) {
-        if (!usage.isCollection) continue;
-        const resolved = resolveImportedSymbol(parsed, usage.name);
-        if (resolved && resolved.kind !== "component") {
-            diagnostics.push(Diagnostic.create(
-                usage.range,
-                `"${usage.name}" cannot be used as a collection type — only components support []`,
-                DiagnosticSeverity.Error,
-                undefined,
-                "cpx"
-            ));
-        }
-    }
-
-    // 5. Unused imports
+    // 4. Unused imports
     diagnostics.push(...unusedImportDiagnostics(parsed));
 
-    // 6. Components must have a render block
+    // 5. Components must have a render block
     for (const exported of parsed.exports) {
         if (exported.kind !== "component") {
             continue;
@@ -1554,7 +1669,7 @@ function validateDocument(parsed) {
         }
     }
 
-    // 7. Prop identifier usages in render body must reference a declared prop
+    // 6. Prop identifier usages in render body must reference a declared prop
     for (const exported of parsed.exports) {
         if (exported.kind !== "component") continue;
         const declaredProps = new Set((exported.props || []).map(p => p.name));
@@ -1576,7 +1691,7 @@ function validateDocument(parsed) {
         }
     }
 
-    // 8. Attribute value enum type checking
+    // 7. Attribute value enum type checking
     //    <MyTag attr={EnumType.MEMBER} /> — validate:
     //    (a) EnumType is imported
     //    (b) MEMBER exists on EnumType
@@ -1629,7 +1744,7 @@ function validateDocument(parsed) {
         }
     }
 
-    // 9. Attribute value literal type checking
+    // 8. Attribute value literal type checking
     //    <MyTag attr={"text"} /> or <MyTag attr="text" /> or <MyTag attr={true} />
     //    — flag when the literal type doesn't match the declared prop type.
     const LITERAL_COMPATIBLE = {
@@ -1726,7 +1841,11 @@ connection.onInitialize(async (params) => {
             },
             codeActionProvider: {
                 codeActionKinds: ["quickfix"]
-            }
+            },
+            documentOnTypeFormattingProvider: {
+                firstTriggerCharacter: ">"
+            },
+            linkedEditingRangeProvider: true
         }
     };
 });
@@ -1928,6 +2047,7 @@ connection.onCompletion((params) => {
     const typeContextEarly = isTypeContext(text, params.position);
     const openTagContextEarly = getOpenTagContext(text, params.position);
     const openHtmlTagContextEarly = getOpenHtmlTagContext(text, params.position);
+    const htmlTagNameContextEarly = isHtmlTagNameContext(text, params.position);
     // Space is registered as a trigger only to surface match-subject completions
     // and attribute completions inside open tags. Bail for all other space triggers
     // so we don't flood normal typing with unwanted suggestions.
@@ -2044,13 +2164,15 @@ connection.onCompletion((params) => {
     const word = currentWord(text, params.position);
     const tagContext = isTagContext(text, params.position);
     const closingTagContext = isClosingTagContext(text, params.position);
+    const existingCloseInfo = tagContext ? getExistingCloseTagInfo(text, params.position) : null;
     const openTagContext = getOpenTagContext(text, params.position);
     const typeContext = typeContextEarly;
     const expressionContext = isExpressionContext(text, params.position);
 
     const openHtmlTagContext = openHtmlTagContextEarly;
+    const htmlTagNameContext = htmlTagNameContextEarly;
 
-    if (!tagContext && !typeContext && !expressionContext) {
+    if (!tagContext && !typeContext && !expressionContext && !htmlTagNameContext) {
         if (!openTagContext && !openHtmlTagContext) {
             return [];
         }
@@ -2249,6 +2371,51 @@ connection.onCompletion((params) => {
         }
     }
 
+    // HTML tag name completions with proper snippets:
+    // void elements (br, img, input…) → self-closing  <br />
+    // regular elements (div, span…)   → paired         <div>$0</div>
+    if ((tagContext && (!word || /^[a-z]/.test(word))) || htmlTagNameContext) {
+        for (const tag of VOID_ELEMENTS) {
+            if (word && !tag.startsWith(word.toLowerCase())) continue;
+            items.push({
+                label: tag,
+                kind: CompletionItemKind.Property,
+                detail: 'HTML void element',
+                insertText: `${tag} />`,
+                insertTextFormat: InsertTextFormat.Snippet,
+                sortText: `z_${tag}`
+            });
+        }
+        for (const tag of HTML_REGULAR_TAGS) {
+            if (word && !tag.startsWith(word.toLowerCase())) continue;
+            if (existingCloseInfo) {
+                items.push({
+                    label: tag,
+                    kind: CompletionItemKind.Property,
+                    detail: 'HTML element',
+                    textEdit: {
+                        range: Range.create(
+                            positionAt(text, existingCloseInfo.wordStart),
+                            positionAt(text, existingCloseInfo.existingCloseTagEnd)
+                        ),
+                        newText: `${tag}>$0</${tag}>`
+                    },
+                    insertTextFormat: InsertTextFormat.Snippet,
+                    sortText: `z_${tag}`
+                });
+            } else {
+                items.push({
+                    label: tag,
+                    kind: CompletionItemKind.Property,
+                    detail: 'HTML element',
+                    insertText: `${tag}>$0</${tag}>`,
+                    insertTextFormat: InsertTextFormat.Snippet,
+                    sortText: `z_${tag}`
+                });
+            }
+        }
+    }
+
     if (tagContext || typeContext) {
         if (tagContext) {
             for (const candidate of localComponentCandidates(parsed)) {
@@ -2256,14 +2423,31 @@ connection.onCompletion((params) => {
                     continue;
                 }
 
-                items.push({
-                    label: candidate.name,
-                    kind: CompletionItemKind.Class,
-                    detail: "Component",
-                    insertText: buildComponentSnippet(candidate, closingTagContext),
-                    insertTextFormat: InsertTextFormat.Snippet,
-                    insertTextMode: InsertTextMode.adjustIndentation
-                });
+                if (existingCloseInfo) {
+                    items.push({
+                        label: candidate.name,
+                        kind: CompletionItemKind.Class,
+                        detail: "Component",
+                        textEdit: {
+                            range: Range.create(
+                                positionAt(text, existingCloseInfo.wordStart),
+                                positionAt(text, existingCloseInfo.existingCloseTagEnd)
+                            ),
+                            newText: buildComponentSnippet(candidate, false)
+                        },
+                        insertTextFormat: InsertTextFormat.Snippet,
+                        insertTextMode: InsertTextMode.adjustIndentation
+                    });
+                } else {
+                    items.push({
+                        label: candidate.name,
+                        kind: CompletionItemKind.Class,
+                        detail: "Component",
+                        insertText: buildComponentSnippet(candidate, closingTagContext),
+                        insertTextFormat: InsertTextFormat.Snippet,
+                        insertTextMode: InsertTextMode.adjustIndentation
+                    });
+                }
             }
         }
 
@@ -2280,24 +2464,45 @@ connection.onCompletion((params) => {
                 range: Range.create(importInsertPosition(parsed), importInsertPosition(parsed)),
                 newText: `from "${candidate.source}" import { ${candidate.name} }\n`
             }];
-            items.push({
-                label: candidate.name,
-                kind: candidate.kind === "enum" ? CompletionItemKind.Enum : CompletionItemKind.Class,
-                detail: `Auto import ${candidate.kind} from ${candidate.source}`,
-                insertText: tagContext ? buildComponentSnippet(candidate, closingTagContext) : candidate.name,
-                insertTextFormat: tagContext ? InsertTextFormat.Snippet : InsertTextFormat.PlainText,
-                insertTextMode: InsertTextMode.adjustIndentation,
-                additionalTextEdits: autoImportEdit,
-                // Same-package suggestions before cross-package ones with the same name.
-                sortText: `${candidate.samePackage ? "1" : "2"}_${candidate.name}`
-            });
-            // Only components can be used as collections (Type[])
-            if (typeContext && !tagContext && candidate.kind === "component") {
+            if (tagContext && existingCloseInfo) {
                 items.push({
-                    label: `${candidate.name}[]`,
+                    label: candidate.name,
+                    kind: candidate.kind === "enum" ? CompletionItemKind.Enum : CompletionItemKind.Class,
+                    detail: `Auto import ${candidate.kind} from ${candidate.source}`,
+                    textEdit: {
+                        range: Range.create(
+                            positionAt(text, existingCloseInfo.wordStart),
+                            positionAt(text, existingCloseInfo.existingCloseTagEnd)
+                        ),
+                        newText: buildComponentSnippet(candidate, false)
+                    },
+                    insertTextFormat: InsertTextFormat.Snippet,
+                    insertTextMode: InsertTextMode.adjustIndentation,
+                    additionalTextEdits: autoImportEdit,
+                    sortText: `${candidate.samePackage ? "1" : "2"}_${candidate.name}`
+                });
+            } else {
+                items.push({
+                    label: candidate.name,
+                    kind: candidate.kind === "enum" ? CompletionItemKind.Enum : CompletionItemKind.Class,
+                    detail: `Auto import ${candidate.kind} from ${candidate.source}`,
+                    insertText: tagContext ? buildComponentSnippet(candidate, closingTagContext) : candidate.name,
+                    insertTextFormat: tagContext ? InsertTextFormat.Snippet : InsertTextFormat.PlainText,
+                    insertTextMode: InsertTextMode.adjustIndentation,
+                    additionalTextEdits: autoImportEdit,
+                    // Same-package suggestions before cross-package ones with the same name.
+                    sortText: `${candidate.samePackage ? "1" : "2"}_${candidate.name}`
+                });
+            }
+            // Any importable type can be wrapped in a `list<…>` collection type —
+            // but not when we're already typing the item type of one (avoids
+            // offering a nonsensical `list<list<Foo>>` double-wrap).
+            if (typeContext && !tagContext && !isInsideGenericTypeArgument(text, params.position)) {
+                items.push({
+                    label: `list<${candidate.name}>`,
                     kind: CompletionItemKind.Class,
-                    detail: `Auto import component[] from ${candidate.source}`,
-                    insertText: `${candidate.name}[]`,
+                    detail: `Auto import list<${candidate.kind}> from ${candidate.source}`,
+                    insertText: `list<${candidate.name}>`,
                     insertTextFormat: InsertTextFormat.PlainText,
                     additionalTextEdits: autoImportEdit
                 });
@@ -2306,6 +2511,171 @@ connection.onCompletion((params) => {
     }
 
     return items;
+});
+
+// Finds the offset of the matching </> for a <> at openTagPos (the < character).
+function findMatchingCloseFragment(text, openTagPos) {
+    const re = /<(\/?)\s*>/g;
+    re.lastIndex = openTagPos + 2; // skip past the <> itself
+    let depth = 0;
+    let match;
+    while ((match = re.exec(text)) !== null) {
+        if (match[1] === '/') {
+            if (depth === 0) return match.index;
+            depth--;
+        } else {
+            depth++;
+        }
+    }
+    return null;
+}
+
+// Finds the offset of the matching <> for a </> whose < is at closeTagPos.
+function findMatchingOpenFragment(text, closeTagPos) {
+    const re = /<(\/?)\s*>/g;
+    const matches = [];
+    let match;
+    while ((match = re.exec(text)) !== null) {
+        if (match.index >= closeTagPos) break;
+        matches.push({ index: match.index, isClose: match[1] === '/' });
+    }
+    let depth = 0;
+    for (let i = matches.length - 1; i >= 0; i--) {
+        const m = matches[i];
+        if (m.isClose) {
+            depth++;
+        } else {
+            if (depth === 0) return m.index;
+            depth--;
+        }
+    }
+    return null;
+}
+
+// Returns the offset of the tag name inside the matching closing </tagName>,
+// scanning forward from scanFrom, respecting nesting depth.
+function findMatchingCloseTag(text, scanFrom, tagName) {
+    const re = new RegExp(`<(/?)(${tagName})(?=[\\s/>])`, 'gi');
+    re.lastIndex = scanFrom;
+    let depth = 0;
+    let match;
+    while ((match = re.exec(text)) !== null) {
+        if (match[1] === '/') {
+            if (depth === 0) return match.index + 2; // offset of tag name after </
+            depth--;
+        } else {
+            // Only count non-self-closing opens
+            const tail = text.slice(match.index + match[0].length);
+            if (!/^\s*\/>/.test(tail)) depth++;
+        }
+    }
+    return null;
+}
+
+// Returns the offset of the tag name inside the matching opening <tagName>,
+// scanning backward from scanFrom.
+function findMatchingOpenTag(text, scanFrom, tagName) {
+    const re = new RegExp(`<(/?)(${tagName})(?=[\\s/>])`, 'gi');
+    let depth = 0;
+    let lastOpen = null;
+    let match;
+    re.lastIndex = 0;
+    // Collect all matches up to scanFrom, then walk backwards
+    const matches = [];
+    while ((match = re.exec(text)) !== null) {
+        if (match.index >= scanFrom) break;
+        matches.push({ index: match.index, isClose: match[1] === '/' });
+    }
+    for (let i = matches.length - 1; i >= 0; i--) {
+        const m = matches[i];
+        if (m.isClose) {
+            depth++;
+        } else {
+            if (depth === 0) return m.index + 1; // offset of tag name after <
+            depth--;
+        }
+    }
+    return null;
+}
+
+connection.languages.onLinkedEditingRange((params) => {
+    const parsed = getDocumentData(params.textDocument.uri);
+    if (!parsed) return null;
+
+    const text = parsed.text;
+    const offset = offsetAt(text, params.position);
+
+    // Find word boundaries around cursor (tag name characters)
+    let start = offset;
+    while (start > 0 && /[A-Za-z0-9_:-]/.test(text[start - 1])) start--;
+    let end = offset;
+    while (end < text.length && /[A-Za-z0-9_:-]/.test(text[end])) end++;
+
+    if (start === end) {
+        // Fragment case: cursor is inside <> or </> with no tag name yet
+        const before = text.slice(0, offset);
+        const after = text.slice(offset);
+        if (before.endsWith('<') && after.startsWith('>')) {
+            // Cursor inside opening fragment <|>
+            const openTagPos = offset - 1;
+            const closeTagPos = findMatchingCloseFragment(text, openTagPos);
+            if (closeTagPos === null) return null;
+            // Insert point inside </> is after the /  (closeTagPos + 2)
+            return { ranges: [
+                makeRange(text, offset, offset),
+                makeRange(text, closeTagPos + 2, closeTagPos + 2)
+            ]};
+        }
+        if (before.endsWith('</') && after.startsWith('>')) {
+            // Cursor inside closing fragment </|>
+            const closeTagPos = offset - 2;
+            const openTagPos = findMatchingOpenFragment(text, closeTagPos);
+            if (openTagPos === null) return null;
+            // Insert point inside <> is after the < (openTagPos + 1)
+            return { ranges: [
+                makeRange(text, openTagPos + 1, openTagPos + 1),
+                makeRange(text, offset, offset)
+            ]};
+        }
+        return null;
+    }
+
+    const tagName = text.slice(start, end);
+    const before = text.slice(0, start);
+    const isOpenTag = before.endsWith('<');
+    const isCloseTag = before.endsWith('</');
+
+    if (!isOpenTag && !isCloseTag) return null;
+    if (VOID_ELEMENTS.has(tagName.toLowerCase())) return null;
+
+    const currentRange = makeRange(text, start, end);
+
+    if (isOpenTag) {
+        const matchOffset = findMatchingCloseTag(text, start, tagName);
+        if (matchOffset === null) return { ranges: [currentRange] };
+        return { ranges: [currentRange, makeRange(text, matchOffset, matchOffset + tagName.length)] };
+    } else {
+        const matchOffset = findMatchingOpenTag(text, start - 2, tagName); // -2 for </
+        if (matchOffset === null) return { ranges: [currentRange] };
+        return { ranges: [makeRange(text, matchOffset, matchOffset + tagName.length), currentRange] };
+    }
+});
+
+connection.onDocumentOnTypeFormatting((params) => {
+    const parsed = getDocumentData(params.textDocument.uri);
+    if (!parsed) return null;
+
+    if (params.ch === '>') {
+        const tagName = getAutoCloseTagName(parsed.text, params.position);
+        if (tagName !== null) {
+            return [{
+                range: Range.create(params.position, params.position),
+                newText: tagName === '' ? '</>' : `</${tagName}>`
+            }];
+        }
+    }
+
+    return null;
 });
 
 connection.onHover((params) => {

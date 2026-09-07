@@ -240,7 +240,7 @@ ok('struct – all type variants', `export struct S {
   c: integer
   d: boolean
   e: MyType
-  f: Button[]
+  f: list<Button>
   g: Red | Green | Blue
 }`);
 
@@ -504,26 +504,61 @@ fail('missing arrow in match arm', `export component X {
 }`, null);
 fail('empty enum body', `export enum E {}`, null);
 fail('missing closing brace in component', `export component X { render <div/>`, '"}"');
-fail('boolean[] is not allowed', `export component X {
+// `Type[]` collection shorthand was replaced by generic `list<Type>` syntax
+// in component-engine 1.0.0-alpha4/5 — `[]` is no longer valid grammar.
+fail('boolean[] is no longer valid syntax', `export component X {
   items: boolean[]
   render <div />
-}`, 'cannot be used as a collection type');
-fail('string[] is not allowed', `export component X {
-  items: string[]
-  render <div />
-}`, 'cannot be used as a collection type');
-fail('number[] is not allowed', `export component X {
-  items: number[]
-  render <div />
-}`, 'cannot be used as a collection type');
-fail('slot[] is not allowed', `export component X {
-  items: slot[]
-  render <div />
-}`, 'cannot be used as a collection type');
-ok('component[] is allowed', `export component X {
+}`, null);
+fail('component[] is no longer valid syntax', `export component X {
   items: Button[]
   render <div />
+}`, null);
+
+ok('list<boolean> is allowed', `export component X {
+  items: list<boolean>
+  render <div />
 }`);
+ok('list<string> is allowed', `export component X {
+  items: list<string>
+  render <div />
+}`);
+ok('list<number> is allowed', `export component X {
+  items: list<number>
+  render <div />
+}`);
+ok('list<slot> is allowed', `export component X {
+  items: list<slot>
+  render <div />
+}`);
+ok('list<component> is allowed', `export component X {
+  items: list<Button>
+  render <div />
+}`);
+ok('nested generic type', `export component X {
+  items: list<list<Button>>
+  render <div />
+}`);
+ok('generic type with multiple arguments', `export component X {
+  items: list<Foo, Bar>
+  render <div />
+}`);
+ok('generic type with trailing comma', `export component X {
+  items: list<Foo, Bar,>
+  render <div />
+}`);
+ok('generic type with whitespace and comments', `export component X {
+  items: list<
+    // comment
+    Foo,
+    /* comment */ Bar,
+  >
+  render <div />
+}`);
+fail('space before "<" is not allowed', `export component X {
+  items: list <Foo>
+  render <div />
+}`, null);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SUMMARY
