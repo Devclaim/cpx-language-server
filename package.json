@@ -1,5 +1,5 @@
 {
-    "name": "cpx-language-server",
+    "name": "component-engine-language-support",
     "displayName": "CPX Language Server",
     "description": "Language server for the CPX component template language (Component Engine)",
     "version": "0.4.1",
